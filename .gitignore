@@ -1,0 +1,4 @@
+ADB/
+__pycache__/
+*.pyc
+*.pyo
