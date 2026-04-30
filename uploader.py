@@ -9,9 +9,12 @@ import threading
 import socket
 import ipaddress
 import os
-import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+
+# Suppress console windows when spawning ADB subprocesses on Windows
+_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 
 def _resource_dir():
@@ -39,12 +42,10 @@ class QuestUploader:
 
         # USB tab state
         self.usb_devices = {}       # serial -> {name, state, status, item_id}
-        self.usb_monitoring = False
         self.auto_enable_var = tk.BooleanVar(value=True)
 
         self._setup_ui()
         self._check_adb()
-        self._start_usb_monitor()
 
     # ------------------------------------------------------------------
     # ADB detection
@@ -62,7 +63,7 @@ class QuestUploader:
         ]
         for c in candidates:
             try:
-                r = subprocess.run([c, "version"], capture_output=True, timeout=5)
+                r = subprocess.run([c, "version"], capture_output=True, timeout=5, creationflags=_NO_WINDOW)
                 if r.returncode == 0:
                     return c
             except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -152,39 +153,14 @@ class QuestUploader:
         ).grid(row=0, column=0, sticky="w")
         bf = ttk.Frame(ctrl)
         bf.grid(row=0, column=1, sticky="e")
-        ttk.Button(bf, text="Enable All", command=self._enable_all_usb, width=14).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(bf, text="Refresh",    command=self._refresh_usb,    width=10).pack(side=tk.RIGHT)
+        ttk.Button(bf, text="Enable All",     command=self._enable_all_usb, width=14).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(bf, text="Detect Devices", command=self._refresh_usb,    width=16).pack(side=tk.RIGHT)
 
-        self.usb_status_label = ttk.Label(parent, text="Monitoring for USB connections...")
+        self.usb_status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
         self.usb_status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
-    # --- USB monitor ---
-
-    def _start_usb_monitor(self):
-        self.usb_monitoring = True
-        threading.Thread(target=self._usb_monitor_worker, daemon=True).start()
-
-    def _usb_monitor_worker(self):
-        prev = {}
-        while self.usb_monitoring:
-            try:
-                if self.adb_path:
-                    current = self._get_usb_devices_raw()
-                    for serial, state in current.items():
-                        if serial not in prev:
-                            self.root.after(0, self._on_usb_appeared, serial, state)
-                        elif prev[serial] == "unauthorized" and state == "device":
-                            self.root.after(0, self._on_usb_authorized, serial)
-                    for serial in list(prev.keys()):
-                        if serial not in current:
-                            self.root.after(0, self._on_usb_removed, serial)
-                    prev = current
-            except Exception:
-                pass
-            time.sleep(2)
-
     def _get_usb_devices_raw(self):
-        r = subprocess.run([self.adb_path, "devices"], capture_output=True, text=True, timeout=10)
+        r = subprocess.run([self.adb_path, "devices"], capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
         result = {}
         for line in r.stdout.splitlines()[1:]:
             parts = line.strip().split()
@@ -197,13 +173,13 @@ class QuestUploader:
         try:
             model_r = subprocess.run(
                 [self.adb_path, "-s", serial, "shell", "getprop ro.product.model"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
             )
             model = model_r.stdout.strip() or "Unknown"
 
             name_r = subprocess.run(
                 [self.adb_path, "-s", serial, "shell", "settings get global device_name"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
             )
             name = name_r.stdout.strip()
             if not name or name.lower() == "null":
@@ -255,7 +231,7 @@ class QuestUploader:
         try:
             r = subprocess.run(
                 [self.adb_path, "-s", serial, "tcpip", "5555"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
             )
             if r.returncode == 0:
                 self.root.after(0, self._update_usb_row, serial, name,
@@ -484,7 +460,7 @@ class QuestUploader:
             r = subprocess.run(
                 [self.adb_path, "-s", serial, "shell",
                  f'test -d "{known}" && echo EXISTS || echo NOT_FOUND'],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
             )
             if r.stdout.strip() == "EXISTS":
                 found = known
@@ -492,14 +468,14 @@ class QuestUploader:
                 r = subprocess.run(
                     [self.adb_path, "-s", serial, "shell",
                      "find /sdcard -maxdepth 4 -type d -iname 'showtime*' 2>/dev/null"],
-                    capture_output=True, text=True, timeout=30,
+                    capture_output=True, text=True, timeout=30, creationflags=_NO_WINDOW,
                 )
                 for c in [l.strip() for l in r.stdout.splitlines() if l.strip()]:
                     for sub in (f"{c}/Videos/3D", f"{c}/Videos", c):
                         r2 = subprocess.run(
                             [self.adb_path, "-s", serial, "shell",
                              f'test -d "{sub}" && echo EXISTS || echo NOT_FOUND'],
-                            capture_output=True, text=True, timeout=10,
+                            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
                         )
                         if r2.stdout.strip() == "EXISTS":
                             found = sub
@@ -566,20 +542,20 @@ class QuestUploader:
                         return
                     r = subprocess.run(
                         [self.adb_path, "connect", f"{ip_str}:5555"],
-                        capture_output=True, text=True, timeout=10,
+                        capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
                     )
                     if "connected" not in r.stdout.lower():
                         return
                     model_r = subprocess.run(
                         [self.adb_path, "-s", f"{ip_str}:5555", "shell",
                          "getprop ro.product.model"],
-                        capture_output=True, text=True, timeout=10,
+                        capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
                     )
                     model = model_r.stdout.strip() or "Unknown"
                     name_r = subprocess.run(
                         [self.adb_path, "-s", f"{ip_str}:5555", "shell",
                          "settings get global device_name"],
-                        capture_output=True, text=True, timeout=10,
+                        capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
                     )
                     name = name_r.stdout.strip()
                     if not name or name.lower() == "null":
@@ -633,7 +609,7 @@ class QuestUploader:
             r = subprocess.run(
                 [self.adb_path, "-s", f"{ip}:5555", "shell",
                  f'stat -c%s "{remote_file}" 2>/dev/null || echo NOT_FOUND'],
-                capture_output=True, text=True, timeout=20,
+                capture_output=True, text=True, timeout=20, creationflags=_NO_WINDOW,
             )
             out = r.stdout.strip()
             return out != "NOT_FOUND" and int(out) == local_size
@@ -660,6 +636,7 @@ class QuestUploader:
                 proc = subprocess.Popen(
                     [self.adb_path, "-s", f"{ip}:5555", "push", file_path, dest_dir],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                    creationflags=_NO_WINDOW,
                 )
                 for line in proc.stdout:
                     line = line.strip()
@@ -740,14 +717,14 @@ class QuestUploader:
             r = subprocess.run(
                 [self.adb_path, "-s", serial, "shell",
                  f'test -f "{remote_file}" && echo EXISTS || echo NOT_FOUND'],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
             )
             if r.stdout.strip() == "NOT_FOUND":
                 self.root.after(0, self._set_wifi_status, ip, "File not found — skipped", "skipped")
             else:
                 r2 = subprocess.run(
                     [self.adb_path, "-s", serial, "shell", f'rm "{remote_file}"'],
-                    capture_output=True, text=True, timeout=15,
+                    capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
                 )
                 if r2.returncode == 0:
                     self.root.after(0, self._set_wifi_status, ip, f"Deleted: {filename}", "done")
@@ -807,7 +784,6 @@ class QuestUploader:
         self.tree.item(item_id, values=(ip, name, status), tags=(tag,) if tag else ())
 
     def _on_close(self):
-        self.usb_monitoring = False
         self.root.destroy()
 
 
