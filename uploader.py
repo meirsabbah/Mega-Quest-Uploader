@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Quest Mass Uploader — push video files to all Quest headsets simultaneously over WiFi."""
+"""Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import subprocess
@@ -13,24 +14,31 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
+def _resource_dir():
+    """Return the directory next to the exe (PyInstaller) or the script."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).parent
+
+
 class QuestUploader:
     def __init__(self, root):
         self.root = root
         self.root.title("Quest Mass Uploader")
-        self.root.geometry("980x780")
-        self.root.minsize(750, 640)
+        self.root.geometry("980x820")
+        self.root.minsize(750, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.adb_path = self._find_adb()
 
         # WiFi tab state
-        self.wifi_devices = {}      # ip -> {model, status, item_id}
+        self.wifi_devices = {}      # ip -> {name, status, item_id}
         self.file_paths = []
+        self.busy = False           # True during upload or delete
         self.scanning = False
-        self.uploading = False
 
         # USB tab state
-        self.usb_devices = {}       # serial -> {model, state, status, item_id}
+        self.usb_devices = {}       # serial -> {name, state, status, item_id}
         self.usb_monitoring = False
         self.auto_enable_var = tk.BooleanVar(value=True)
 
@@ -43,10 +51,10 @@ class QuestUploader:
     # ------------------------------------------------------------------
 
     def _find_adb(self):
-        script_dir = Path(__file__).parent
+        base = _resource_dir()
         username = os.environ.get("USERNAME", os.environ.get("USER", ""))
         candidates = [
-            str(script_dir / "ADB" / "adb.exe"),
+            str(base / "ADB" / "adb.exe"),
             "adb",
             rf"C:\Users\{username}\AppData\Local\Android\Sdk\platform-tools\adb.exe",
             r"C:\Program Files\Android\android-sdk\platform-tools\adb.exe",
@@ -67,24 +75,22 @@ class QuestUploader:
         else:
             self.adb_label.config(
                 text="ADB not found — place the ADB folder next to this script",
-                foreground="red"
+                foreground="red",
             )
 
     # ------------------------------------------------------------------
-    # UI root
+    # Root UI
     # ------------------------------------------------------------------
 
     def _setup_ui(self):
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        # Global ADB status bar
         top = ttk.Frame(self.root, padding=(10, 6))
         top.grid(row=0, column=0, sticky="ew")
         self.adb_label = ttk.Label(top, text="ADB: Checking...")
         self.adb_label.pack(side=tk.LEFT)
 
-        # Notebook
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
 
@@ -104,59 +110,50 @@ class QuestUploader:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        info = ttk.Label(
+        ttk.Label(
             parent,
             text=(
-                "Plug headsets in via USB one batch at a time. "
-                "Accept the 'Allow USB Debugging' prompt on each headset when it appears. "
-                "Once enabled, the headset will be discoverable over WiFi — safe to unplug."
+                "Plug headsets in via USB. Accept the 'Allow USB Debugging' prompt on each "
+                "headset. Once enabled, the headset is discoverable over WiFi — safe to unplug."
             ),
             wraplength=800, justify=tk.LEFT,
-        )
-        info.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-        # Device list
-        list_frame = ttk.LabelFrame(parent, text="USB Connected Devices", padding=5)
-        list_frame.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        lf = ttk.LabelFrame(parent, text="USB Connected Devices", padding=5)
+        lf.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
 
-        cols = ("Serial", "Model", "Status")
-        self.usb_tree = ttk.Treeview(list_frame, columns=cols, show="headings")
-        self.usb_tree.heading("Serial", text="Serial / ID")
-        self.usb_tree.heading("Model",  text="Device Model")
-        self.usb_tree.heading("Status", text="Status")
-        self.usb_tree.column("Serial", width=200, minwidth=150)
-        self.usb_tree.column("Model",  width=200, minwidth=150)
-        self.usb_tree.column("Status", width=420, minwidth=200)
-
+        cols = ("Serial", "Device Name", "Status")
+        self.usb_tree = ttk.Treeview(lf, columns=cols, show="headings")
+        self.usb_tree.heading("Serial",      text="Serial / ID")
+        self.usb_tree.heading("Device Name", text="Device Name")
+        self.usb_tree.heading("Status",      text="Status")
+        self.usb_tree.column("Serial",      width=200, minwidth=150)
+        self.usb_tree.column("Device Name", width=220, minwidth=150)
+        self.usb_tree.column("Status",      width=380, minwidth=200)
         self.usb_tree.tag_configure("ready",    background="#d4edda", foreground="#155724")
         self.usb_tree.tag_configure("enabling", background="#fff3cd", foreground="#856404")
         self.usb_tree.tag_configure("unauth",   background="#fff3cd", foreground="#856404")
         self.usb_tree.tag_configure("error",    background="#f8d7da", foreground="#721c24")
 
-        usb_vscroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.usb_tree.yview)
-        self.usb_tree.configure(yscrollcommand=usb_vscroll.set)
+        vsc = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.usb_tree.yview)
+        self.usb_tree.configure(yscrollcommand=vsc.set)
         self.usb_tree.grid(row=0, column=0, sticky="nsew")
-        usb_vscroll.grid(row=0, column=1, sticky="ns")
+        vsc.grid(row=0, column=1, sticky="ns")
 
-        # Controls row
         ctrl = ttk.Frame(parent)
         ctrl.grid(row=2, column=0, sticky="ew")
         ctrl.columnconfigure(0, weight=1)
-
         ttk.Checkbutton(
             ctrl,
             text="Automatically enable WiFi ADB when a headset is plugged in",
             variable=self.auto_enable_var,
         ).grid(row=0, column=0, sticky="w")
-
-        btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=0, column=1, sticky="e")
-        ttk.Button(btn_frame, text="Enable All",
-                   command=self._enable_all_usb, width=14).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(btn_frame, text="Refresh",
-                   command=self._refresh_usb, width=10).pack(side=tk.RIGHT)
+        bf = ttk.Frame(ctrl)
+        bf.grid(row=0, column=1, sticky="e")
+        ttk.Button(bf, text="Enable All", command=self._enable_all_usb, width=14).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(bf, text="Refresh",    command=self._refresh_usb,    width=10).pack(side=tk.RIGHT)
 
         self.usb_status_label = ttk.Label(parent, text="Monitoring for USB connections...")
         self.usb_status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
@@ -168,34 +165,26 @@ class QuestUploader:
         threading.Thread(target=self._usb_monitor_worker, daemon=True).start()
 
     def _usb_monitor_worker(self):
-        prev = {}   # serial -> state string
+        prev = {}
         while self.usb_monitoring:
             try:
                 if self.adb_path:
                     current = self._get_usb_devices_raw()
-
                     for serial, state in current.items():
                         if serial not in prev:
                             self.root.after(0, self._on_usb_appeared, serial, state)
-                        elif prev[serial] != state and prev[serial] == "unauthorized" and state == "device":
-                            # User just accepted the USB debugging dialog
+                        elif prev[serial] == "unauthorized" and state == "device":
                             self.root.after(0, self._on_usb_authorized, serial)
-
                     for serial in list(prev.keys()):
                         if serial not in current:
                             self.root.after(0, self._on_usb_removed, serial)
-
                     prev = current
             except Exception:
                 pass
             time.sleep(2)
 
     def _get_usb_devices_raw(self):
-        """Return {serial: state} for USB-connected devices only (no TCP/IP)."""
-        r = subprocess.run(
-            [self.adb_path, "devices"],
-            capture_output=True, text=True, timeout=10,
-        )
+        r = subprocess.run([self.adb_path, "devices"], capture_output=True, text=True, timeout=10)
         result = {}
         for line in r.stdout.splitlines()[1:]:
             parts = line.strip().split()
@@ -203,51 +192,57 @@ class QuestUploader:
                 result[parts[0]] = parts[1]
         return result
 
-    def _get_model_usb(self, serial):
+    def _get_device_info_usb(self, serial):
+        """Return (model, device_name) for a USB-connected device."""
         try:
-            r = subprocess.run(
+            model_r = subprocess.run(
                 [self.adb_path, "-s", serial, "shell", "getprop ro.product.model"],
                 capture_output=True, text=True, timeout=10,
             )
-            return r.stdout.strip() or "Unknown"
+            model = model_r.stdout.strip() or "Unknown"
+
+            name_r = subprocess.run(
+                [self.adb_path, "-s", serial, "shell", "settings get global device_name"],
+                capture_output=True, text=True, timeout=10,
+            )
+            name = name_r.stdout.strip()
+            if not name or name.lower() == "null":
+                name = model
+            return model, name
         except Exception:
-            return "Unknown"
+            return "Unknown", "Unknown"
 
     def _on_usb_appeared(self, serial, state):
         if serial in self.usb_devices:
             return
         if state == "unauthorized":
-            model = "—"
+            name   = "—"
             status, tag = "Waiting — accept USB Debugging on the headset", "unauth"
         else:
-            model = self._get_model_usb(serial)
+            _, name = self._get_device_info_usb(serial)
             status, tag = "Connected", ""
 
-        item_id = self.usb_tree.insert("", tk.END, values=(serial, model, status),
+        item_id = self.usb_tree.insert("", tk.END, values=(serial, name, status),
                                         tags=(tag,) if tag else ())
-        self.usb_devices[serial] = {"model": model, "state": state,
-                                     "status": status, "item_id": item_id}
+        self.usb_devices[serial] = {"name": name, "state": state, "status": status, "item_id": item_id}
         self.usb_status_label.config(text=f"{len(self.usb_devices)} device(s) connected via USB.")
 
         if state == "device" and self.auto_enable_var.get():
             threading.Thread(target=self._enable_wifi_adb, args=(serial,), daemon=True).start()
 
     def _on_usb_authorized(self, serial):
-        """Called when a device transitions from unauthorized → device."""
         if serial not in self.usb_devices:
             return
-        model = self._get_model_usb(serial)
-        self.usb_devices[serial]["state"] = "device"
-        self.usb_devices[serial]["model"] = model
-        self._update_usb_row(serial, model, "Authorized — enabling WiFi ADB...", "enabling")
+        _, name = self._get_device_info_usb(serial)
+        self.usb_devices[serial].update({"state": "device", "name": name})
+        self._update_usb_row(serial, name, "Authorized — enabling WiFi ADB...", "enabling")
         if self.auto_enable_var.get():
             threading.Thread(target=self._enable_wifi_adb, args=(serial,), daemon=True).start()
 
     def _on_usb_removed(self, serial):
         if serial not in self.usb_devices:
             return
-        item_id = self.usb_devices[serial]["item_id"]
-        self.usb_tree.delete(item_id)
+        self.usb_tree.delete(self.usb_devices[serial]["item_id"])
         del self.usb_devices[serial]
         self.usb_status_label.config(
             text=f"{len(self.usb_devices)} device(s) connected via USB."
@@ -255,39 +250,32 @@ class QuestUploader:
         )
 
     def _enable_wifi_adb(self, serial):
-        self.root.after(0, self._update_usb_row, serial,
-                        self.usb_devices.get(serial, {}).get("model", "—"),
-                        "Enabling WiFi ADB...", "enabling")
+        name = self.usb_devices.get(serial, {}).get("name", "—")
+        self.root.after(0, self._update_usb_row, serial, name, "Enabling WiFi ADB...", "enabling")
         try:
             r = subprocess.run(
                 [self.adb_path, "-s", serial, "tcpip", "5555"],
                 capture_output=True, text=True, timeout=15,
             )
             if r.returncode == 0:
-                self.root.after(0, self._update_usb_row, serial,
-                                self.usb_devices.get(serial, {}).get("model", "—"),
+                self.root.after(0, self._update_usb_row, serial, name,
                                 "WiFi ADB enabled — safe to unplug", "ready")
             else:
-                self.root.after(0, self._update_usb_row, serial,
-                                self.usb_devices.get(serial, {}).get("model", "—"),
+                self.root.after(0, self._update_usb_row, serial, name,
                                 f"Failed: {(r.stderr or r.stdout).strip()}", "error")
         except Exception as e:
-            self.root.after(0, self._update_usb_row, serial,
-                            self.usb_devices.get(serial, {}).get("model", "—"),
-                            f"Error: {e}", "error")
+            self.root.after(0, self._update_usb_row, serial, name, f"Error: {e}", "error")
 
-    def _update_usb_row(self, serial, model, status, tag):
+    def _update_usb_row(self, serial, name, status, tag):
         if serial not in self.usb_devices:
             return
         self.usb_devices[serial]["status"] = status
-        item_id = self.usb_devices[serial]["item_id"]
-        self.usb_tree.item(item_id, values=(serial, model, status),
-                            tags=(tag,) if tag else ())
+        self.usb_tree.item(self.usb_devices[serial]["item_id"],
+                            values=(serial, name, status), tags=(tag,) if tag else ())
 
     def _refresh_usb(self):
-        if not self.adb_path:
-            return
-        threading.Thread(target=self._refresh_usb_worker, daemon=True).start()
+        if self.adb_path:
+            threading.Thread(target=self._refresh_usb_worker, daemon=True).start()
 
     def _refresh_usb_worker(self):
         current = self._get_usb_devices_raw()
@@ -303,7 +291,7 @@ class QuestUploader:
         if not targets:
             messagebox.showinfo("Nothing to enable",
                                 "No authorized devices connected.\n"
-                                "Make sure you accepted the USB Debugging prompt on each headset.")
+                                "Accept the USB Debugging prompt on each headset first.")
             return
         for serial in targets:
             threading.Thread(target=self._enable_wifi_adb, args=(serial,), daemon=True).start()
@@ -316,116 +304,106 @@ class QuestUploader:
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
 
-        # Top scan bar
+        # Scan bar
         top = ttk.Frame(parent, padding=(10, 8))
         top.grid(row=0, column=0, sticky="ew")
         top.columnconfigure(1, weight=1)
-
         self.device_count_label = ttk.Label(top, text="Devices found: 0")
         self.device_count_label.grid(row=0, column=1, sticky="e", padx=10)
-
         self.scan_btn = ttk.Button(top, text="Scan Network", command=self.start_scan, width=16)
         self.scan_btn.grid(row=0, column=2, sticky="e")
 
         # Device list
-        list_frame = ttk.LabelFrame(parent, text="Connected Devices", padding=5)
-        list_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        list_frame.columnconfigure(0, weight=1)
-        list_frame.rowconfigure(0, weight=1)
+        lf = ttk.LabelFrame(parent, text="Connected Devices", padding=5)
+        lf.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
 
-        cols = ("IP Address", "Model", "Status")
-        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="extended")
-        self.tree.heading("IP Address", text="IP Address")
-        self.tree.heading("Model",      text="Device Model")
-        self.tree.heading("Status",     text="Status")
-        self.tree.column("IP Address", width=140, minwidth=120)
-        self.tree.column("Model",      width=200, minwidth=140)
-        self.tree.column("Status",     width=520, minwidth=200)
-
+        cols = ("IP Address", "Device Name", "Status")
+        self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="extended")
+        self.tree.heading("IP Address",  text="IP Address")
+        self.tree.heading("Device Name", text="Device Name")
+        self.tree.heading("Status",      text="Status")
+        self.tree.column("IP Address",  width=140, minwidth=120)
+        self.tree.column("Device Name", width=220, minwidth=150)
+        self.tree.column("Status",      width=480, minwidth=200)
         self.tree.tag_configure("done",      background="#d4edda", foreground="#155724")
         self.tree.tag_configure("skipped",   background="#e2e3e5", foreground="#383d41")
         self.tree.tag_configure("uploading", background="#fff3cd", foreground="#856404")
         self.tree.tag_configure("checking",  background="#d1ecf1", foreground="#0c5460")
         self.tree.tag_configure("error",     background="#f8d7da", foreground="#721c24")
-
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_change)
 
-        vscroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vscroll.set)
+        vsc = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsc.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
-        vscroll.grid(row=0, column=1, sticky="ns")
+        vsc.grid(row=0, column=1, sticky="ns")
 
-        # Selection buttons
-        sel_bar = ttk.Frame(list_frame)
+        sel_bar = ttk.Frame(lf)
         sel_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(sel_bar, text="Select All",   command=self._select_all,   width=14).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(sel_bar, text="Deselect All", command=self._deselect_all, width=14).pack(side=tk.LEFT)
         self.selected_label = ttk.Label(sel_bar, text="Selected: 0 / 0")
         self.selected_label.pack(side=tk.RIGHT)
 
-        # Settings
+        # Settings area
         settings = ttk.Frame(parent, padding=(10, 4))
         settings.grid(row=2, column=0, sticky="ew")
         settings.columnconfigure(0, weight=1)
 
-        # File list
+        # --- Upload files ---
         files_frame = ttk.LabelFrame(settings, text="Video Files to Upload", padding=5)
         files_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         files_frame.columnconfigure(0, weight=1)
-
-        self.file_listbox = tk.Listbox(files_frame, height=4, selectmode=tk.EXTENDED,
-                                        activestyle="none")
-        hscroll = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL,
-                                  command=self.file_listbox.xview)
-        self.file_listbox.configure(xscrollcommand=hscroll.set)
+        self.file_listbox = tk.Listbox(files_frame, height=3, selectmode=tk.EXTENDED, activestyle="none")
+        hsc = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL, command=self.file_listbox.xview)
+        self.file_listbox.configure(xscrollcommand=hsc.set)
         self.file_listbox.grid(row=0, column=0, sticky="ew")
-        hscroll.grid(row=1, column=0, sticky="ew")
+        hsc.grid(row=1, column=0, sticky="ew")
+        fb = ttk.Frame(files_frame)
+        fb.grid(row=0, column=1, sticky="n", padx=(6, 0))
+        ttk.Button(fb, text="Add Files",  command=self._add_files,             width=12).pack(pady=2)
+        ttk.Button(fb, text="Remove",     command=self._remove_selected_files,  width=12).pack(pady=2)
+        ttk.Button(fb, text="Clear All",  command=self._clear_files,            width=12).pack(pady=2)
 
-        file_btns = ttk.Frame(files_frame)
-        file_btns.grid(row=0, column=1, sticky="n", padx=(6, 0))
-        ttk.Button(file_btns, text="Add Files",  command=self._add_files,              width=12).pack(pady=2)
-        ttk.Button(file_btns, text="Remove",     command=self._remove_selected_files,  width=12).pack(pady=2)
-        ttk.Button(file_btns, text="Clear All",  command=self._clear_files,            width=12).pack(pady=2)
+        # --- Delete file ---
+        del_frame = ttk.LabelFrame(settings, text="Delete File from Devices", padding=5)
+        del_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        del_frame.columnconfigure(1, weight=1)
+        ttk.Label(del_frame, text="Filename:", width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        self.delete_var = tk.StringVar()
+        ttk.Entry(del_frame, textvariable=self.delete_var).grid(row=0, column=1, sticky="ew", padx=5)
+        self.delete_btn = ttk.Button(del_frame, text="Delete from Selected",
+                                      command=self._delete_from_devices, width=22)
+        self.delete_btn.grid(row=0, column=2)
 
-        # Dest + concurrency
+        # --- Dest + concurrent ---
         opt_row = ttk.Frame(settings)
-        opt_row.grid(row=1, column=0, sticky="ew")
+        opt_row.grid(row=2, column=0, sticky="ew")
         opt_row.columnconfigure(1, weight=1)
-
-        ttk.Label(opt_row, text="Dest Folder:", width=14, anchor="w").grid(
-            row=0, column=0, sticky="w", pady=3)
+        ttk.Label(opt_row, text="Dest Folder:", width=14, anchor="w").grid(row=0, column=0, sticky="w", pady=3)
         self.dest_var = tk.StringVar(value="/sdcard/Showtime VR/Videos/3D")
-        ttk.Entry(opt_row, textvariable=self.dest_var).grid(
-            row=0, column=1, sticky="ew", padx=5)
-        self.discover_btn = ttk.Button(opt_row, text="Discover",
-                                        command=self._discover_path, width=10)
+        ttk.Entry(opt_row, textvariable=self.dest_var).grid(row=0, column=1, sticky="ew", padx=5)
+        self.discover_btn = ttk.Button(opt_row, text="Discover", command=self._discover_path, width=10)
         self.discover_btn.grid(row=0, column=2, sticky="e")
-
-        ttk.Label(opt_row, text="Concurrent:", width=14, anchor="w").grid(
-            row=1, column=0, sticky="w", pady=3)
+        ttk.Label(opt_row, text="Concurrent:", width=14, anchor="w").grid(row=1, column=0, sticky="w", pady=3)
         batch_row = ttk.Frame(opt_row)
         batch_row.grid(row=1, column=1, sticky="w", padx=5)
         self.batch_var = tk.IntVar(value=30)
         ttk.Spinbox(batch_row, from_=1, to=300, textvariable=self.batch_var, width=8).pack(side=tk.LEFT)
-        ttk.Label(batch_row, text="simultaneous uploads").pack(side=tk.LEFT, padx=6)
+        ttk.Label(batch_row, text="simultaneous operations").pack(side=tk.LEFT, padx=6)
 
         # Bottom bar
         bottom = ttk.Frame(parent, padding=(10, 6))
         bottom.grid(row=3, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
-
         self.progress_var = tk.DoubleVar()
         ttk.Progressbar(bottom, variable=self.progress_var, maximum=100).grid(
-            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6)
-        )
-
+            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
         self.status_label = ttk.Label(bottom, text="Ready — scan the network to find devices.")
         self.status_label.grid(row=1, column=0, sticky="w")
-
-        self.upload_btn = ttk.Button(
-            bottom, text="Upload to Selected Devices",
-            command=self.start_upload, state=tk.DISABLED, width=24,
-        )
+        self.upload_btn = ttk.Button(bottom, text="Upload to Selected Devices",
+                                      command=self.start_upload, state=tk.DISABLED, width=24)
         self.upload_btn.grid(row=1, column=1, sticky="e")
 
     # ------------------------------------------------------------------
@@ -441,18 +419,18 @@ class QuestUploader:
             if p not in self.file_paths:
                 self.file_paths.append(p)
                 self.file_listbox.insert(tk.END, p)
-        self._refresh_upload_btn()
+        self._refresh_buttons()
 
     def _remove_selected_files(self):
         for i in reversed(self.file_listbox.curselection()):
             self.file_listbox.delete(i)
             self.file_paths.pop(i)
-        self._refresh_upload_btn()
+        self._refresh_buttons()
 
     def _clear_files(self):
         self.file_listbox.delete(0, tk.END)
         self.file_paths.clear()
-        self._refresh_upload_btn()
+        self._refresh_buttons()
 
     # ------------------------------------------------------------------
     # Device selection
@@ -470,20 +448,20 @@ class QuestUploader:
         selected = len(self.tree.selection())
         total = len(self.tree.get_children())
         self.selected_label.config(text=f"Selected: {selected} / {total}")
-        self._refresh_upload_btn()
+        self._refresh_buttons()
 
     def _get_selected_ips(self):
         item_to_ip = {d["item_id"]: ip for ip, d in self.wifi_devices.items()}
         return [item_to_ip[iid] for iid in self.tree.selection() if iid in item_to_ip]
 
-    def _refresh_upload_btn(self):
-        ready = (
-            bool(self._get_selected_ips())
-            and bool(self.file_paths)
-            and not self.uploading
-            and not self.scanning
-        )
-        self.upload_btn.config(state=tk.NORMAL if ready else tk.DISABLED)
+    def _refresh_buttons(self):
+        has_devices = bool(self._get_selected_ips())
+        idle = not self.busy and not self.scanning
+        self.upload_btn.config(state=tk.NORMAL if (has_devices and self.file_paths and idle) else tk.DISABLED)
+        self.delete_btn.config(state=tk.NORMAL if (has_devices and idle) else tk.DISABLED)
+
+    # keep old name as alias so nothing else breaks
+    _refresh_upload_btn = _refresh_buttons
 
     # ------------------------------------------------------------------
     # Path discovery
@@ -492,7 +470,7 @@ class QuestUploader:
     def _discover_path(self):
         ips = self._get_selected_ips() or list(self.wifi_devices.keys())
         if not ips:
-            messagebox.showwarning("No Devices", "Scan the network first to find devices.")
+            messagebox.showwarning("No Devices", "Scan the network first.")
             return
         self.discover_btn.config(state=tk.DISABLED, text="Discovering...")
         self.status_label.config(text=f"Discovering Showtime VR path from {ips[0]}...")
@@ -516,8 +494,7 @@ class QuestUploader:
                      "find /sdcard -maxdepth 4 -type d -iname 'showtime*' 2>/dev/null"],
                     capture_output=True, text=True, timeout=30,
                 )
-                candidates = [l.strip() for l in r.stdout.splitlines() if l.strip()]
-                for c in candidates:
+                for c in [l.strip() for l in r.stdout.splitlines() if l.strip()]:
                     for sub in (f"{c}/Videos/3D", f"{c}/Videos", c):
                         r2 = subprocess.run(
                             [self.adb_path, "-s", serial, "shell",
@@ -536,13 +513,10 @@ class QuestUploader:
 
         if found:
             self.root.after(0, self.dest_var.set, found)
-            self.root.after(0, lambda p=found: self.status_label.config(text=f"Path found and set: {p}"))
+            self.root.after(0, lambda p=found: self.status_label.config(text=f"Path found: {p}"))
         else:
             self.root.after(0, lambda: messagebox.showwarning(
-                "Not Found",
-                "Could not locate a Showtime VR folder on the device.\n"
-                "Enter the destination path manually.",
-            ))
+                "Not Found", "Could not locate a Showtime VR folder.\nEnter the path manually."))
             self.root.after(0, self.status_label.config, {"text": "Path not found — enter manually."})
         self.root.after(0, self.discover_btn.config, {"state": tk.NORMAL, "text": "Discover"})
 
@@ -557,18 +531,18 @@ class QuestUploader:
             local_ip = s.getsockname()[0]
         finally:
             s.close()
-        prefix = local_ip.rsplit(".", 1)[0]
-        return f"{prefix}.0/24"
+        return local_ip.rsplit(".", 1)[0] + ".0/24"
 
     def start_scan(self):
         if not self.adb_path:
-            messagebox.showerror("ADB Not Found", "ADB is not installed or not in PATH.")
+            messagebox.showerror("ADB Not Found", "ADB not found.")
             return
-        if self.scanning or self.uploading:
+        if self.scanning or self.busy:
             return
         self.scanning = True
         self.scan_btn.config(state=tk.DISABLED, text="Scanning...")
         self.upload_btn.config(state=tk.DISABLED)
+        self.delete_btn.config(state=tk.DISABLED)
         self.tree.delete(*self.tree.get_children())
         self.wifi_devices.clear()
         self.device_count_label.config(text="Devices found: 0")
@@ -579,8 +553,7 @@ class QuestUploader:
 
     def _scan_worker(self):
         try:
-            subnet = self._get_local_subnet()
-            hosts = list(ipaddress.IPv4Network(subnet, strict=False).hosts())
+            hosts = list(ipaddress.IPv4Network(self._get_local_subnet(), strict=False).hosts())
 
             def probe(ip):
                 ip_str = str(ip)
@@ -603,7 +576,15 @@ class QuestUploader:
                         capture_output=True, text=True, timeout=10,
                     )
                     model = model_r.stdout.strip() or "Unknown"
-                    self.root.after(0, self._add_wifi_device, ip_str, model)
+                    name_r = subprocess.run(
+                        [self.adb_path, "-s", f"{ip_str}:5555", "shell",
+                         "settings get global device_name"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    name = name_r.stdout.strip()
+                    if not name or name.lower() == "null":
+                        name = model
+                    self.root.after(0, self._add_wifi_device, ip_str, name)
                 except Exception:
                     pass
 
@@ -612,21 +593,20 @@ class QuestUploader:
         finally:
             self.root.after(0, self._scan_done)
 
-    def _add_wifi_device(self, ip, model):
-        item_id = self.tree.insert("", tk.END, values=(ip, model, "Ready"))
-        self.wifi_devices[ip] = {"model": model, "status": "Ready", "item_id": item_id}
+    def _add_wifi_device(self, ip, name):
+        item_id = self.tree.insert("", tk.END, values=(ip, name, "Ready"))
+        self.wifi_devices[ip] = {"name": name, "status": "Ready", "item_id": item_id}
         self.tree.selection_add(item_id)
-        total = len(self.tree.get_children())
+        total    = len(self.tree.get_children())
         selected = len(self.tree.selection())
         self.device_count_label.config(text=f"Devices found: {total}")
         self.selected_label.config(text=f"Selected: {selected} / {total}")
 
     def _scan_done(self):
         self.scanning = False
-        count = len(self.wifi_devices)
         self.scan_btn.config(state=tk.NORMAL, text="Scan Network")
-        self.status_label.config(text=f"Scan complete — {count} device(s) found.")
-        self._refresh_upload_btn()
+        self.status_label.config(text=f"Scan complete — {len(self.wifi_devices)} device(s) found.")
+        self._refresh_buttons()
 
     # ------------------------------------------------------------------
     # Upload
@@ -634,17 +614,13 @@ class QuestUploader:
 
     def start_upload(self):
         selected_ips = self._get_selected_ips()
-        if not selected_ips:
-            messagebox.showerror("No Devices Selected", "Select at least one device from the list.")
+        if not selected_ips or not self.file_paths:
             return
-        if not self.file_paths:
-            messagebox.showerror("No Files", "Please add at least one video file.")
-            return
-        self.uploading = True
-        self.upload_btn.config(state=tk.DISABLED)
+        self.busy = True
         self.scan_btn.config(state=tk.DISABLED)
+        self._refresh_buttons()
         for ip in selected_ips:
-            self._set_wifi_device_status(ip, "Waiting...", "")
+            self._set_wifi_status(ip, "Waiting...", "")
         self.progress_var.set(0)
         threading.Thread(
             target=self._upload_worker,
@@ -660,9 +636,7 @@ class QuestUploader:
                 capture_output=True, text=True, timeout=20,
             )
             out = r.stdout.strip()
-            if out == "NOT_FOUND":
-                return False
-            return int(out) == local_size
+            return out != "NOT_FOUND" and int(out) == local_size
         except Exception:
             return False
 
@@ -675,103 +649,162 @@ class QuestUploader:
             remote_file = dest_dir.rstrip("/") + "/" + filename
             prefix = f"[{i+1}/{n}] {filename}: " if n > 1 else f"{filename}: "
 
-            self.root.after(0, self._set_wifi_device_status, ip,
-                            f"{prefix}Checking...", "checking")
-
+            self.root.after(0, self._set_wifi_status, ip, f"{prefix}Checking...", "checking")
             if self._file_exists_on_device(ip, remote_file, file_sizes[i]):
                 skipped += 1
-                self.root.after(0, self._set_wifi_device_status, ip,
-                                f"{prefix}Already on device — skipped", "skipped")
+                self.root.after(0, self._set_wifi_status, ip, f"{prefix}Already on device — skipped", "skipped")
                 continue
 
-            self.root.after(0, self._set_wifi_device_status, ip,
-                            f"{prefix}Starting upload...", "uploading")
+            self.root.after(0, self._set_wifi_status, ip, f"{prefix}Starting upload...", "uploading")
             try:
                 proc = subprocess.Popen(
                     [self.adb_path, "-s", f"{ip}:5555", "push", file_path, dest_dir],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
                 )
                 for line in proc.stdout:
                     line = line.strip()
                     if line.startswith("[") and "%" in line:
                         try:
                             pct = int(line.split("%")[0].strip("[").strip())
-                            self.root.after(0, self._set_wifi_device_status, ip,
+                            self.root.after(0, self._set_wifi_status, ip,
                                             f"{prefix}Uploading {pct}%", "uploading")
                         except ValueError:
                             pass
                 proc.wait()
                 if proc.returncode == 0:
                     uploaded += 1
-                    self.root.after(0, self._set_wifi_device_status, ip, f"{prefix}Done", "done")
+                    self.root.after(0, self._set_wifi_status, ip, f"{prefix}Done", "done")
                 else:
                     errors += 1
-                    self.root.after(0, self._set_wifi_device_status, ip,
-                                    f"{prefix}Transfer failed", "error")
+                    self.root.after(0, self._set_wifi_status, ip, f"{prefix}Transfer failed", "error")
             except Exception as e:
                 errors += 1
-                self.root.after(0, self._set_wifi_device_status, ip,
-                                f"{prefix}Error — {e}", "error")
+                self.root.after(0, self._set_wifi_status, ip, f"{prefix}Error — {e}", "error")
 
         parts = []
         if uploaded: parts.append(f"{uploaded} uploaded")
         if skipped:  parts.append(f"{skipped} already on device")
         if errors:   parts.append(f"{errors} failed")
-        final_status = " | ".join(parts) if parts else "Done"
-        final_tag = "error" if errors else ("skipped" if uploaded == 0 else "done")
-        self.root.after(0, self._set_wifi_device_status, ip, final_status, final_tag)
-
-        with lock:
-            counter[0] += 1
-            done = counter[0]
-            pct = (done / total) * 100
-        self.root.after(0, self.progress_var.set, pct)
-        self.root.after(0, lambda d=done: self.status_label.config(
-            text=f"Progress: {d}/{total} devices processed"
-        ))
+        final = " | ".join(parts) if parts else "Done"
+        self.root.after(0, self._set_wifi_status, ip, final,
+                        "error" if errors else ("skipped" if not uploaded else "done"))
+        self._tick_progress(counter, total, lock, "uploaded")
 
     def _upload_worker(self, selected_ips, file_paths):
-        dest_dir = self.dest_var.get().strip()
-        batch_size = self.batch_var.get()
-        total = len(selected_ips)
+        dest_dir   = self.dest_var.get().strip()
         file_sizes = [os.path.getsize(p) for p in file_paths]
         counter = [0]
         lock = threading.Lock()
-
-        with ThreadPoolExecutor(max_workers=batch_size) as ex:
+        with ThreadPoolExecutor(max_workers=self.batch_var.get()) as ex:
             for ip in selected_ips:
                 ex.submit(self._upload_one, ip, file_paths, dest_dir,
-                          file_sizes, counter, total, lock)
+                          file_sizes, counter, len(selected_ips), lock)
+        self.root.after(0, self._operation_done, "Upload")
 
-        self.root.after(0, self._upload_done)
+    # ------------------------------------------------------------------
+    # Delete
+    # ------------------------------------------------------------------
 
-    def _upload_done(self):
-        self.uploading = False
+    def _delete_from_devices(self):
+        filename = self.delete_var.get().strip()
+        if not filename:
+            messagebox.showerror("No Filename", "Enter the exact filename to delete (e.g. movie.mp4).")
+            return
+        selected_ips = self._get_selected_ips()
+        if not selected_ips:
+            messagebox.showerror("No Devices", "Select at least one device.")
+            return
+        if not messagebox.askyesno(
+            "Confirm Delete",
+            f"Delete  '{filename}'  from {len(selected_ips)} device(s)?\n\nThis cannot be undone.",
+        ):
+            return
+        self.busy = True
+        self.scan_btn.config(state=tk.DISABLED)
+        self._refresh_buttons()
+        for ip in selected_ips:
+            self._set_wifi_status(ip, "Waiting to delete...", "")
+        self.progress_var.set(0)
+        dest_dir    = self.dest_var.get().strip()
+        remote_file = dest_dir.rstrip("/") + "/" + filename
+        threading.Thread(
+            target=self._delete_worker,
+            args=(selected_ips, remote_file, filename),
+            daemon=True,
+        ).start()
+
+    def _delete_one(self, ip, remote_file, filename, counter, total, lock):
+        serial = f"{ip}:5555"
+        self.root.after(0, self._set_wifi_status, ip, f"Checking for {filename}...", "checking")
+        try:
+            r = subprocess.run(
+                [self.adb_path, "-s", serial, "shell",
+                 f'test -f "{remote_file}" && echo EXISTS || echo NOT_FOUND'],
+                capture_output=True, text=True, timeout=15,
+            )
+            if r.stdout.strip() == "NOT_FOUND":
+                self.root.after(0, self._set_wifi_status, ip, "File not found — skipped", "skipped")
+            else:
+                r2 = subprocess.run(
+                    [self.adb_path, "-s", serial, "shell", f'rm "{remote_file}"'],
+                    capture_output=True, text=True, timeout=15,
+                )
+                if r2.returncode == 0:
+                    self.root.after(0, self._set_wifi_status, ip, f"Deleted: {filename}", "done")
+                else:
+                    self.root.after(0, self._set_wifi_status, ip, "Delete failed", "error")
+        except Exception as e:
+            self.root.after(0, self._set_wifi_status, ip, f"Error: {e}", "error")
+        self._tick_progress(counter, total, lock, "deleted")
+
+    def _delete_worker(self, selected_ips, remote_file, filename):
+        counter = [0]
+        lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=self.batch_var.get()) as ex:
+            for ip in selected_ips:
+                ex.submit(self._delete_one, ip, remote_file, filename,
+                          counter, len(selected_ips), lock)
+        self.root.after(0, self._operation_done, "Delete")
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    def _tick_progress(self, counter, total, lock, verb):
+        with lock:
+            counter[0] += 1
+            done = counter[0]
+            pct  = (done / total) * 100
+        self.root.after(0, self.progress_var.set, pct)
+        self.root.after(0, lambda d=done: self.status_label.config(
+            text=f"Progress: {d}/{total} devices {verb}"
+        ))
+
+    def _operation_done(self, op_name):
+        self.busy = False
         self.scan_btn.config(state=tk.NORMAL)
-        self._refresh_upload_btn()
+        self._refresh_buttons()
         statuses = [d["status"] for d in self.wifi_devices.values()]
-        all_uploaded = sum(1 for s in statuses if "uploaded" in s or s == "Done")
-        all_skipped  = sum(1 for s in statuses if "already on device" in s and "uploaded" not in s)
-        all_errors   = sum(1 for s in statuses if "failed" in s or "Error" in s)
-        summary = (
-            f"Finished — {all_uploaded} device(s) uploaded new files, "
-            f"{all_skipped} fully skipped, {all_errors} had errors."
-        )
+        if op_name == "Upload":
+            ok  = sum(1 for s in statuses if "uploaded" in s or s == "Done")
+            skp = sum(1 for s in statuses if "already on device" in s and "uploaded" not in s)
+            err = sum(1 for s in statuses if "failed" in s or "Error" in s)
+            summary = f"Upload complete — {ok} uploaded, {skp} skipped, {err} errors."
+        else:
+            ok  = sum(1 for s in statuses if s.startswith("Deleted"))
+            skp = sum(1 for s in statuses if "not found" in s)
+            err = sum(1 for s in statuses if "failed" in s or "Error" in s)
+            summary = f"Delete complete — {ok} deleted, {skp} not found, {err} errors."
         self.status_label.config(text=summary)
-        messagebox.showinfo("Upload Complete", summary)
+        messagebox.showinfo(f"{op_name} Complete", summary)
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _set_wifi_device_status(self, ip, status, tag):
+    def _set_wifi_status(self, ip, status, tag):
         if ip not in self.wifi_devices:
             return
         self.wifi_devices[ip]["status"] = status
         item_id = self.wifi_devices[ip]["item_id"]
-        model = self.wifi_devices[ip]["model"]
-        self.tree.item(item_id, values=(ip, model, status), tags=(tag,) if tag else ())
+        name    = self.wifi_devices[ip]["name"]
+        self.tree.item(item_id, values=(ip, name, status), tags=(tag,) if tag else ())
 
     def _on_close(self):
         self.usb_monitoring = False
