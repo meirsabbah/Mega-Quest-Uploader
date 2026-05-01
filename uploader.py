@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 import sys
 import tkinter as tk
@@ -979,24 +979,25 @@ class QuestUploader:
                     line = line.strip()
                     if not line or line[0] != '-':
                         continue
-                    # Split into at most 9 tokens to handle both date formats:
-                    #   ISO  (2 date fields): perm links owner group size DATE TIME name
-                    #   Mon  (3 date fields): perm links owner group size MON  DAY  TIME name
-                    parts = line.split(None, 8)
-                    if len(parts) < 8:
+                    # Unlimited split to inspect fields without discarding anything
+                    tokens = line.split()
+                    if len(tokens) < 8:
                         continue
                     try:
-                        size_str = _human_size(int(parts[4]))
+                        size_str = _human_size(int(tokens[4]))
                     except ValueError:
-                        size_str = parts[4]
-                    # Detect ISO date by YYYY-MM-DD pattern in field 5
-                    date_field = parts[5]
+                        size_str = tokens[4]
+                    # Detect date format from field 5 and re-split with the exact maxsplit
+                    # so the LAST piece captures the full filename including any spaces.
+                    #   ISO  date (YYYY-MM-DD): 7 prefix fields → split(None, 7)  → parts[7]
+                    #   Month-name date (Jan…): 8 prefix fields → split(None, 8)  → parts[8]
+                    date_field = tokens[5]
                     if len(date_field) == 10 and date_field[4] == '-' and date_field[7] == '-':
-                        filename = parts[7].strip()   # ISO: name is the 8th field
-                    elif len(parts) >= 9:
-                        filename = parts[8].strip()   # month-name: name is the 9th field
+                        parts = line.split(None, 7)
+                        filename = parts[7].strip() if len(parts) >= 8 else ""
                     else:
-                        filename = parts[7].strip()
+                        parts = line.split(None, 8)
+                        filename = parts[8].strip() if len(parts) >= 9 else ""
                     if filename:
                         files.append((filename, size_str))
 
@@ -1046,10 +1047,21 @@ class QuestUploader:
             self._on_selection_change()
             dlg.destroy()
 
+        def copy_filename():
+            selected = ftree.selection()
+            if not selected:
+                return
+            filename = ftree.item(selected[0], "values")[0]
+            dlg.clipboard_clear()
+            dlg.clipboard_append(filename)
+            self.delete_var.set(filename)   # also pre-fill the Delete field on main window
+            status_lbl.config(text=f'Copied: {filename}')
+
         ftree.bind("<Double-1>", lambda e: delete_selected())
 
         ttk.Button(btn_bar, text="Refresh",         command=refresh,         width=10).pack(side=tk.LEFT)
         ttk.Button(btn_bar, text="Delete Selected", command=delete_selected, width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_bar, text="Copy Name",       command=copy_filename,   width=12).pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_bar, text="Deselect Device", command=deselect_device, width=16).pack(side=tk.LEFT)
         ttk.Button(btn_bar, text="Close",           command=dlg.destroy,     width=10).pack(side=tk.RIGHT)
 
