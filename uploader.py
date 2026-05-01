@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 import sys
 import tkinter as tk
@@ -960,48 +960,62 @@ class QuestUploader:
 
         def load_files():
             try:
-                # Include stderr so we can see permission errors / bad paths
                 r = subprocess.run(
                     [self.adb_path, "-s", f"{ip}:5555", "shell",
                      f'ls -la "{dest_dir}/"'],
-                    capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
+                    capture_output=True, timeout=15, creationflags=_NO_WINDOW,
                 )
-                output = (r.stdout or "").strip()
+                # Decode bytes manually — more reliable than text=True over ADB WiFi on Windows
+                output = (r.stdout or b"").decode("utf-8", errors="replace").strip()
 
                 if not output:
-                    err = (r.stderr or "").strip() or "Folder is empty or does not exist"
-                    dlg.after(0, lambda m=err: status_lbl.config(text=m))
-                    dlg.after(0, lambda: _populate([]))
+                    stderr = (r.stderr or b"").decode("utf-8", errors="replace").strip()
+                    msg = stderr or "Folder is empty or does not exist"
+                    dlg.after(0, lambda m=msg: _populate([], m))
                     return
 
                 files = []
                 for line in output.splitlines():
-                    # split(None, 7) preserves spaces in the filename (last field)
-                    parts = line.split(None, 7)
-                    if len(parts) >= 8 and parts[0].startswith("-"):
-                        try:
-                            size = _human_size(int(parts[4]))
-                        except ValueError:
-                            size = parts[4]
+                    line = line.strip()
+                    if not line or line[0] != '-':
+                        continue
+                    # Split into at most 9 tokens to handle both date formats:
+                    #   ISO  (2 date fields): perm links owner group size DATE TIME name
+                    #   Mon  (3 date fields): perm links owner group size MON  DAY  TIME name
+                    parts = line.split(None, 8)
+                    if len(parts) < 8:
+                        continue
+                    try:
+                        size_str = _human_size(int(parts[4]))
+                    except ValueError:
+                        size_str = parts[4]
+                    # Detect ISO date by YYYY-MM-DD pattern in field 5
+                    date_field = parts[5]
+                    if len(date_field) == 10 and date_field[4] == '-' and date_field[7] == '-':
+                        filename = parts[7].strip()   # ISO: name is the 8th field
+                    elif len(parts) >= 9:
+                        filename = parts[8].strip()   # month-name: name is the 9th field
+                    else:
                         filename = parts[7].strip()
-                        files.append((filename, size))
+                    if filename:
+                        files.append((filename, size_str))
 
-                if not files:
-                    # Nothing matched — show a snippet of the raw output to help diagnose
-                    preview = output.splitlines()[0] if output else "(empty)"
-                    dlg.after(0, lambda p=preview: status_lbl.config(
-                        text=f"Could not parse listing. First line: {p}"))
-                    dlg.after(0, lambda: _populate([]))
-                else:
+                if files:
                     dlg.after(0, lambda f=files: _populate(f))
+                else:
+                    # Show the first non-blank line so the format can be diagnosed
+                    first = next((l for l in output.splitlines() if l.strip()), "(empty)")
+                    dlg.after(0, lambda p=first: _populate(
+                        [], f"Could not read files. Raw output: {p}"))
             except Exception as e:
                 dlg.after(0, lambda err=str(e): status_lbl.config(text=f"Error: {err}"))
 
-        def _populate(files):
+        def _populate(files, status_msg=None):
             ftree.delete(*ftree.get_children())
             for filename, size in files:
                 ftree.insert("", tk.END, values=(filename, size))
-            status_lbl.config(text=f"{len(files)} file(s)  —  double-click a file to delete it")
+            status_lbl.config(text=status_msg if status_msg else
+                              f"{len(files)} file(s)  —  double-click a file to delete it")
 
         def refresh():
             status_lbl.config(text="Loading...")
