@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
+VERSION = "1.0.1"
+
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -35,7 +37,7 @@ def _human_size(b):
 class QuestUploader:
     def __init__(self, root):
         self.root = root
-        self.root.title("Quest Mass Uploader")
+        self.root.title(f"Quest Mass Uploader  v{VERSION}")
         self.root.geometry("980x820")
         self.root.minsize(750, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -99,6 +101,7 @@ class QuestUploader:
         top.grid(row=0, column=0, sticky="ew")
         self.adb_label = ttk.Label(top, text="ADB: Checking...")
         self.adb_label.pack(side=tk.LEFT)
+        ttk.Label(top, text=f"v{VERSION}", foreground="gray").pack(side=tk.RIGHT)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -963,10 +966,10 @@ class QuestUploader:
                      f'ls -la "{dest_dir}/"'],
                     capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
                 )
-                output = r.stdout.strip()
+                output = (r.stdout or "").strip()
 
                 if not output:
-                    err = r.stderr.strip() or "Folder is empty or does not exist"
+                    err = (r.stderr or "").strip() or "Folder is empty or does not exist"
                     dlg.after(0, lambda m=err: status_lbl.config(text=m))
                     dlg.after(0, lambda: _populate([]))
                     return
