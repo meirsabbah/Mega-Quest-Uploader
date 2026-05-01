@@ -957,25 +957,42 @@ class QuestUploader:
 
         def load_files():
             try:
+                # Include stderr so we can see permission errors / bad paths
                 r = subprocess.run(
                     [self.adb_path, "-s", f"{ip}:5555", "shell",
-                     f'ls -la "{dest_dir}" 2>/dev/null'],
+                     f'ls -la "{dest_dir}/"'],
                     capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
                 )
+                output = r.stdout.strip()
+
+                if not output:
+                    err = r.stderr.strip() or "Folder is empty or does not exist"
+                    dlg.after(0, lambda m=err: status_lbl.config(text=m))
+                    dlg.after(0, lambda: _populate([]))
+                    return
+
                 files = []
-                for line in r.stdout.splitlines():
-                    parts = line.split()
-                    # Android ls -la: perms links owner group size date time name...
+                for line in output.splitlines():
+                    # split(None, 7) preserves spaces in the filename (last field)
+                    parts = line.split(None, 7)
                     if len(parts) >= 8 and parts[0].startswith("-"):
                         try:
                             size = _human_size(int(parts[4]))
                         except ValueError:
                             size = parts[4]
-                        filename = " ".join(parts[7:])
+                        filename = parts[7].strip()
                         files.append((filename, size))
-                dlg.after(0, lambda f=files: _populate(f))
+
+                if not files:
+                    # Nothing matched — show a snippet of the raw output to help diagnose
+                    preview = output.splitlines()[0] if output else "(empty)"
+                    dlg.after(0, lambda p=preview: status_lbl.config(
+                        text=f"Could not parse listing. First line: {p}"))
+                    dlg.after(0, lambda: _populate([]))
+                else:
+                    dlg.after(0, lambda f=files: _populate(f))
             except Exception as e:
-                dlg.after(0, lambda: status_lbl.config(text=f"Error: {e}"))
+                dlg.after(0, lambda err=str(e): status_lbl.config(text=f"Error: {err}"))
 
         def _populate(files):
             ftree.delete(*ftree.get_children())
