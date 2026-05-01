@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 import sys
 import tkinter as tk
@@ -1031,14 +1031,26 @@ class QuestUploader:
                     f"Delete {len(names)} file(s) from {device_name}?", parent=dlg):
                 return
             status_lbl.config(text="Deleting...")
-            def do_delete():
-                for fn in names:
+            def do_delete(sel=selected, fns=names):
+                removed = []
+                for item_id, fn in zip(sel, fns):
                     remote = dest_dir.rstrip("/") + "/" + fn
-                    subprocess.run(
+                    r = subprocess.run(
                         [self.adb_path, "-s", f"{ip}:5555", "shell", f'rm "{remote}"'],
-                        capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
+                        capture_output=True, timeout=15, creationflags=_NO_WINDOW,
                     )
-                dlg.after(0, refresh)
+                    if r.returncode == 0:
+                        removed.append(item_id)
+                def _apply():
+                    for iid in removed:
+                        try:
+                            ftree.delete(iid)
+                        except Exception:
+                            pass
+                    remaining = len(ftree.get_children())
+                    status_lbl.config(
+                        text=f"{remaining} file(s)  —  double-click a file to delete it")
+                dlg.after(0, _apply)
             threading.Thread(target=do_delete, daemon=True).start()
 
         def deselect_device():
