@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 import sys
 import tkinter as tk
@@ -742,11 +742,12 @@ class QuestUploader:
     def _upload_one(self, ip, file_paths, dest_dir, file_sizes, counter, total, lock):
         n = len(file_paths)
         uploaded = skipped = errors = 0
+        last_error = ""
 
         # Ensure destination directory exists before any push
         subprocess.run(
             [self.adb_path, "-s", f"{ip}:5555", "shell", f'mkdir -p "{dest_dir}"'],
-            capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
+            capture_output=True, timeout=15, creationflags=_NO_WINDOW,
         )
 
         for i, file_path in enumerate(file_paths):
@@ -764,11 +765,11 @@ class QuestUploader:
             try:
                 proc = subprocess.Popen(
                     [self.adb_path, "-s", f"{ip}:5555", "push", file_path, dest_dir],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
                     creationflags=_NO_WINDOW,
                 )
-                for line in proc.stdout:
-                    line = line.strip()
+                for raw_line in proc.stdout:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
                     if line.startswith("[") and "%" in line:
                         try:
                             pct = int(line.split("%")[0].strip("[").strip())
@@ -782,15 +783,21 @@ class QuestUploader:
                     self.root.after(0, self._set_wifi_status, ip, f"{prefix}Done", "done")
                 else:
                     errors += 1
-                    self.root.after(0, self._set_wifi_status, ip, f"{prefix}Transfer failed", "error")
+                    last_error = f"adb exit {proc.returncode}"
+                    self.root.after(0, self._set_wifi_status, ip, f"{prefix}Transfer failed (exit {proc.returncode})", "error")
             except Exception as e:
                 errors += 1
+                last_error = str(e)
                 self.root.after(0, self._set_wifi_status, ip, f"{prefix}Error — {e}", "error")
 
         parts = []
         if uploaded: parts.append(f"{uploaded} uploaded")
         if skipped:  parts.append(f"{skipped} already on device")
-        if errors:   parts.append(f"{errors} failed")
+        if errors:
+            err_txt = f"{errors} failed"
+            if last_error:
+                err_txt += f" ({last_error})"
+            parts.append(err_txt)
         final = " | ".join(parts) if parts else "Done"
         self.root.after(0, self._set_wifi_status, ip, final,
                         "error" if errors else ("skipped" if not uploaded else "done"))
