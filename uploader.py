@@ -24,6 +24,14 @@ def _resource_dir():
     return Path(__file__).parent
 
 
+def _human_size(b):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f} {unit}"
+        b /= 1024
+    return f"{b:.1f} TB"
+
+
 class QuestUploader:
     def __init__(self, root):
         self.root = root
@@ -159,6 +167,30 @@ class QuestUploader:
         self.usb_status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
         self.usb_status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
+    def _get_showtime_name(self, serial):
+        """Read the device name from Showtime VR's config.txt. Returns None if unavailable."""
+        try:
+            r = subprocess.run(
+                [self.adb_path, "-s", serial, "shell", 'cat "/sdcard/Showtime VR/config.txt"'],
+                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+            )
+            content = r.stdout.strip()
+            if not content:
+                return None
+
+            # Parse "key = value" lines — format used by Showtime VR config.txt
+            for line in content.splitlines():
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                if key.strip().lower() == "name":
+                    val = val.strip().strip('"').strip("'")
+                    if val:
+                        return val
+        except Exception:
+            pass
+        return None
+
     def _get_usb_devices_raw(self):
         r = subprocess.run([self.adb_path, "devices"], capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW)
         result = {}
@@ -177,13 +209,7 @@ class QuestUploader:
             )
             model = model_r.stdout.strip() or "Unknown"
 
-            name_r = subprocess.run(
-                [self.adb_path, "-s", serial, "shell", "settings get global device_name"],
-                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
-            )
-            name = name_r.stdout.strip()
-            if not name or name.lower() == "null":
-                name = model
+            name = self._get_showtime_name(serial) or model
             return model, name
         except Exception:
             return "Unknown", "Unknown"
@@ -309,6 +335,7 @@ class QuestUploader:
         self.tree.tag_configure("checking",  background="#d1ecf1", foreground="#0c5460")
         self.tree.tag_configure("error",     background="#f8d7da", foreground="#721c24")
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_change)
+        self.tree.bind("<Double-1>", self._on_device_double_click)
 
         vsc = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsc.set)
@@ -353,9 +380,23 @@ class QuestUploader:
                                       command=self._delete_from_devices, width=22)
         self.delete_btn.grid(row=0, column=2)
 
+        # --- APK Installation ---
+        apk_frame = ttk.LabelFrame(settings, text="APK Installation", padding=5)
+        apk_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
+        apk_frame.columnconfigure(1, weight=1)
+        ttk.Label(apk_frame, text="APK File:", width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        self.apk_var = tk.StringVar()
+        self.apk_combo = ttk.Combobox(apk_frame, textvariable=self.apk_var, state="readonly", width=40)
+        self.apk_combo.grid(row=0, column=1, sticky="ew", padx=5)
+        ttk.Button(apk_frame, text="Refresh", command=self._scan_apk_folder, width=8).grid(row=0, column=2, padx=(0, 4))
+        ttk.Button(apk_frame, text="Browse",  command=self._browse_apk,       width=8).grid(row=0, column=3)
+        self.install_btn = ttk.Button(apk_frame, text="Install on Selected Devices",
+                                       command=self._install_apk, width=26)
+        self.install_btn.grid(row=1, column=0, columnspan=4, sticky="e", pady=(6, 0))
+
         # --- Dest + concurrent ---
         opt_row = ttk.Frame(settings)
-        opt_row.grid(row=2, column=0, sticky="ew")
+        opt_row.grid(row=3, column=0, sticky="ew")
         opt_row.columnconfigure(1, weight=1)
         ttk.Label(opt_row, text="Dest Folder:", width=14, anchor="w").grid(row=0, column=0, sticky="w", pady=3)
         self.dest_var = tk.StringVar(value="/sdcard/Showtime VR/Videos/3D")
@@ -381,6 +422,9 @@ class QuestUploader:
         self.upload_btn = ttk.Button(bottom, text="Upload to Selected Devices",
                                       command=self.start_upload, state=tk.DISABLED, width=24)
         self.upload_btn.grid(row=1, column=1, sticky="e")
+
+        # Scan for APKs now that all buttons exist
+        self._scan_apk_folder()
 
     # ------------------------------------------------------------------
     # File management
@@ -409,6 +453,87 @@ class QuestUploader:
         self._refresh_buttons()
 
     # ------------------------------------------------------------------
+    # APK management
+    # ------------------------------------------------------------------
+
+    def _scan_apk_folder(self):
+        """Populate the APK combobox with any .apk files found in the ADB folder."""
+        adb_dir = _resource_dir() / "ADB"
+        apks = sorted(adb_dir.glob("*.apk")) if adb_dir.is_dir() else []
+        self._apk_paths = {p.name: str(p) for p in apks}
+        self.apk_combo["values"] = list(self._apk_paths.keys())
+        if self._apk_paths and not self.apk_var.get():
+            self.apk_combo.current(0)
+        self._refresh_buttons()
+
+    def _browse_apk(self):
+        path = filedialog.askopenfilename(
+            title="Select APK",
+            filetypes=[("Android packages", "*.apk"), ("All files", "*.*")],
+        )
+        if path:
+            name = Path(path).name
+            self._apk_paths[name] = path
+            values = list(self.apk_combo["values"])
+            if name not in values:
+                values.append(name)
+                self.apk_combo["values"] = values
+            self.apk_var.set(name)
+            self._refresh_buttons()
+
+    def _get_selected_apk_path(self):
+        name = self.apk_var.get().strip()
+        return getattr(self, "_apk_paths", {}).get(name)
+
+    def _install_apk(self):
+        apk_path = self._get_selected_apk_path()
+        if not apk_path:
+            messagebox.showerror("No APK", "Select or browse to an APK file first.")
+            return
+        selected_ips = self._get_selected_ips()
+        if not selected_ips:
+            messagebox.showerror("No Devices", "Select at least one device.")
+            return
+        self.busy = True
+        self.scan_btn.config(state=tk.DISABLED)
+        self._refresh_buttons()
+        for ip in selected_ips:
+            self._set_wifi_status(ip, "Waiting to install...", "")
+        self.progress_var.set(0)
+        threading.Thread(
+            target=self._install_worker,
+            args=(selected_ips, apk_path),
+            daemon=True,
+        ).start()
+
+    def _install_one(self, ip, apk_path, counter, total, lock):
+        serial = f"{ip}:5555"
+        apk_name = Path(apk_path).name
+        self.root.after(0, self._set_wifi_status, ip, f"Installing {apk_name}...", "uploading")
+        try:
+            r = subprocess.run(
+                [self.adb_path, "-s", serial, "install", "-r", "-g", apk_path],
+                capture_output=True, text=True, timeout=180, creationflags=_NO_WINDOW,
+            )
+            combined = (r.stdout + r.stderr).strip()
+            if r.returncode == 0 and "success" in combined.lower():
+                self.root.after(0, self._set_wifi_status, ip, f"Installed: {apk_name}", "done")
+            else:
+                reason = combined.splitlines()[-1] if combined else "Unknown error"
+                self.root.after(0, self._set_wifi_status, ip, f"Failed: {reason}", "error")
+        except Exception as e:
+            self.root.after(0, self._set_wifi_status, ip, f"Error: {e}", "error")
+        self._tick_progress(counter, total, lock, "processed")
+
+    def _install_worker(self, selected_ips, apk_path):
+        counter = [0]
+        lock = threading.Lock()
+        with ThreadPoolExecutor(max_workers=self.batch_var.get()) as ex:
+            for ip in selected_ips:
+                ex.submit(self._install_one, ip, apk_path, counter, len(selected_ips), lock)
+        self.root.after(0, self._operation_done, "Install")
+
+    # ------------------------------------------------------------------
     # Device selection
     # ------------------------------------------------------------------
 
@@ -435,6 +560,8 @@ class QuestUploader:
         idle = not self.busy and not self.scanning
         self.upload_btn.config(state=tk.NORMAL if (has_devices and self.file_paths and idle) else tk.DISABLED)
         self.delete_btn.config(state=tk.NORMAL if (has_devices and idle) else tk.DISABLED)
+        has_apk = bool(getattr(self, "_apk_paths", {}) and self.apk_var.get())
+        self.install_btn.config(state=tk.NORMAL if (has_devices and has_apk and idle) else tk.DISABLED)
 
     # keep old name as alias so nothing else breaks
     _refresh_upload_btn = _refresh_buttons
@@ -552,14 +679,7 @@ class QuestUploader:
                         capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
                     )
                     model = model_r.stdout.strip() or "Unknown"
-                    name_r = subprocess.run(
-                        [self.adb_path, "-s", f"{ip_str}:5555", "shell",
-                         "settings get global device_name"],
-                        capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
-                    )
-                    name = name_r.stdout.strip()
-                    if not name or name.lower() == "null":
-                        name = model
+                    name = self._get_showtime_name(f"{ip_str}:5555") or model
                     self.root.after(0, self._add_wifi_device, ip_str, name)
                 except Exception:
                     pass
@@ -619,6 +739,12 @@ class QuestUploader:
     def _upload_one(self, ip, file_paths, dest_dir, file_sizes, counter, total, lock):
         n = len(file_paths)
         uploaded = skipped = errors = 0
+
+        # Ensure destination directory exists before any push
+        subprocess.run(
+            [self.adb_path, "-s", f"{ip}:5555", "shell", f'mkdir -p "{dest_dir}"'],
+            capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
+        )
 
         for i, file_path in enumerate(file_paths):
             filename = Path(file_path).name
@@ -767,13 +893,133 @@ class QuestUploader:
             skp = sum(1 for s in statuses if "already on device" in s and "uploaded" not in s)
             err = sum(1 for s in statuses if "failed" in s or "Error" in s)
             summary = f"Upload complete — {ok} uploaded, {skp} skipped, {err} errors."
-        else:
+        elif op_name == "Delete":
             ok  = sum(1 for s in statuses if s.startswith("Deleted"))
             skp = sum(1 for s in statuses if "not found" in s)
             err = sum(1 for s in statuses if "failed" in s or "Error" in s)
             summary = f"Delete complete — {ok} deleted, {skp} not found, {err} errors."
+        else:  # Install
+            ok  = sum(1 for s in statuses if s.startswith("Installed"))
+            err = sum(1 for s in statuses if "Failed" in s or "Error" in s)
+            summary = f"Install complete — {ok} succeeded, {err} failed."
         self.status_label.config(text=summary)
         messagebox.showinfo(f"{op_name} Complete", summary)
+
+    # ------------------------------------------------------------------
+    # Device file browser
+    # ------------------------------------------------------------------
+
+    def _on_device_double_click(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if not item_id:
+            return
+        item_to_ip = {d["item_id"]: ip for ip, d in self.wifi_devices.items()}
+        ip = item_to_ip.get(item_id)
+        if ip:
+            self._open_file_browser(ip, self.wifi_devices[ip]["name"])
+
+    def _open_file_browser(self, ip, device_name):
+        dest_dir = self.dest_var.get().strip()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Files on {device_name}")
+        dlg.geometry("640x420")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.columnconfigure(0, weight=1)
+        dlg.rowconfigure(1, weight=1)
+
+        ttk.Label(dlg, text=dest_dir, foreground="gray").grid(
+            row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+
+        # File list
+        lf = ttk.Frame(dlg, padding=5)
+        lf.grid(row=1, column=0, sticky="nsew", padx=10)
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(0, weight=1)
+
+        cols = ("Filename", "Size")
+        ftree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="extended")
+        ftree.heading("Filename", text="Filename")
+        ftree.heading("Size",     text="Size")
+        ftree.column("Filename", width=460, minwidth=300)
+        ftree.column("Size",     width=100, minwidth=80, anchor="e")
+        vsc = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=ftree.yview)
+        ftree.configure(yscrollcommand=vsc.set)
+        ftree.grid(row=0, column=0, sticky="nsew")
+        vsc.grid(row=0, column=1, sticky="ns")
+
+        status_lbl = ttk.Label(dlg, text="Loading...")
+        status_lbl.grid(row=2, column=0, sticky="w", padx=10, pady=4)
+
+        btn_bar = ttk.Frame(dlg, padding=(10, 4))
+        btn_bar.grid(row=3, column=0, sticky="ew")
+
+        def load_files():
+            try:
+                r = subprocess.run(
+                    [self.adb_path, "-s", f"{ip}:5555", "shell",
+                     f'ls -la "{dest_dir}" 2>/dev/null'],
+                    capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
+                )
+                files = []
+                for line in r.stdout.splitlines():
+                    parts = line.split()
+                    # Android ls -la: perms links owner group size date time name...
+                    if len(parts) >= 8 and parts[0].startswith("-"):
+                        try:
+                            size = _human_size(int(parts[4]))
+                        except ValueError:
+                            size = parts[4]
+                        filename = " ".join(parts[7:])
+                        files.append((filename, size))
+                dlg.after(0, lambda f=files: _populate(f))
+            except Exception as e:
+                dlg.after(0, lambda: status_lbl.config(text=f"Error: {e}"))
+
+        def _populate(files):
+            ftree.delete(*ftree.get_children())
+            for filename, size in files:
+                ftree.insert("", tk.END, values=(filename, size))
+            status_lbl.config(text=f"{len(files)} file(s)  —  double-click a file to delete it")
+
+        def refresh():
+            status_lbl.config(text="Loading...")
+            threading.Thread(target=load_files, daemon=True).start()
+
+        def delete_selected():
+            selected = ftree.selection()
+            if not selected:
+                return
+            names = [ftree.item(i, "values")[0] for i in selected]
+            if not messagebox.askyesno("Confirm Delete",
+                    f"Delete {len(names)} file(s) from {device_name}?", parent=dlg):
+                return
+            status_lbl.config(text="Deleting...")
+            def do_delete():
+                for fn in names:
+                    remote = dest_dir.rstrip("/") + "/" + fn
+                    subprocess.run(
+                        [self.adb_path, "-s", f"{ip}:5555", "shell", f'rm "{remote}"'],
+                        capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
+                    )
+                dlg.after(0, refresh)
+            threading.Thread(target=do_delete, daemon=True).start()
+
+        def deselect_device():
+            item_id = self.wifi_devices[ip]["item_id"]
+            self.tree.selection_remove(item_id)
+            self._on_selection_change()
+            dlg.destroy()
+
+        ftree.bind("<Double-1>", lambda e: delete_selected())
+
+        ttk.Button(btn_bar, text="Refresh",         command=refresh,         width=10).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text="Delete Selected", command=delete_selected, width=16).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_bar, text="Deselect Device", command=deselect_device, width=16).pack(side=tk.LEFT)
+        ttk.Button(btn_bar, text="Close",           command=dlg.destroy,     width=10).pack(side=tk.RIGHT)
+
+        refresh()
 
     def _set_wifi_status(self, ip, status, tag):
         if ip not in self.wifi_devices:
