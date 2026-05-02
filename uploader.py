@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import sv_ttk
 import subprocess
 import threading
 import socket
@@ -38,8 +39,8 @@ class QuestUploader:
     def __init__(self, root):
         self.root = root
         self.root.title(f"Quest Mass Uploader  v{VERSION}")
-        self.root.geometry("980x820")
-        self.root.minsize(750, 680)
+        self.root.geometry("1060x720")
+        self.root.minsize(860, 540)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self.adb_path = self._find_adb()
@@ -82,11 +83,11 @@ class QuestUploader:
 
     def _check_adb(self):
         if self.adb_path:
-            self.adb_label.config(text="ADB: Ready", foreground="green")
+            self.adb_label.config(text="ADB: Ready", foreground="#00bc8c")
         else:
             self.adb_label.config(
                 text="ADB not found — place the ADB folder next to this script",
-                foreground="red",
+                foreground="#e74c3c",
             )
 
     # ------------------------------------------------------------------
@@ -94,14 +95,19 @@ class QuestUploader:
     # ------------------------------------------------------------------
 
     def _setup_ui(self):
+        sv_ttk.set_theme("dark")
+        style = ttk.Style()
+        # Windows 11 accent button for the primary Upload action
+        style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"))
+        style.configure("TNotebook.Tab", padding=(12, 5))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        top = ttk.Frame(self.root, padding=(10, 6))
+        top = ttk.Frame(self.root, padding=(12, 8))
         top.grid(row=0, column=0, sticky="ew")
         self.adb_label = ttk.Label(top, text="ADB: Checking...")
         self.adb_label.pack(side=tk.LEFT)
-        ttk.Label(top, text=f"v{VERSION}", foreground="gray").pack(side=tk.RIGHT)
+        ttk.Label(top, text=f"v{VERSION}", foreground="#888").pack(side=tk.RIGHT)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
@@ -144,10 +150,10 @@ class QuestUploader:
         self.usb_tree.column("Serial",      width=200, minwidth=150)
         self.usb_tree.column("Device Name", width=220, minwidth=150)
         self.usb_tree.column("Status",      width=380, minwidth=200)
-        self.usb_tree.tag_configure("ready",    background="#d4edda", foreground="#155724")
-        self.usb_tree.tag_configure("enabling", background="#fff3cd", foreground="#856404")
-        self.usb_tree.tag_configure("unauth",   background="#fff3cd", foreground="#856404")
-        self.usb_tree.tag_configure("error",    background="#f8d7da", foreground="#721c24")
+        self.usb_tree.tag_configure("ready",    background="#1a3d2b", foreground="#00bc8c")
+        self.usb_tree.tag_configure("enabling", background="#3d2e00", foreground="#f39c12")
+        self.usb_tree.tag_configure("unauth",   background="#3d2e00", foreground="#f39c12")
+        self.usb_tree.tag_configure("error",    background="#3d1010", foreground="#e74c3c")
 
         vsc = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.usb_tree.yview)
         self.usb_tree.configure(yscrollcommand=vsc.set)
@@ -165,7 +171,7 @@ class QuestUploader:
         bf = ttk.Frame(ctrl)
         bf.grid(row=0, column=1, sticky="e")
         ttk.Button(bf, text="Enable All",     command=self._enable_all_usb, width=14).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(bf, text="Detect Devices", command=self._refresh_usb,    width=16).pack(side=tk.RIGHT)
+        ttk.Button(bf, text="Detect Devices", command=self._refresh_usb,   width=16).pack(side=tk.RIGHT)
 
         self.usb_status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
         self.usb_status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
@@ -306,127 +312,176 @@ class QuestUploader:
     # ------------------------------------------------------------------
 
     def _setup_wifi_tab(self, parent):
+        # Two-column layout: device list on the left, controls on the right
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(1, weight=0)   # right panel natural width
+        parent.rowconfigure(0, weight=1)
 
-        # Scan bar
-        top = ttk.Frame(parent, padding=(10, 8))
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(1, weight=1)
-        self.device_count_label = ttk.Label(top, text="Devices found: 0")
-        self.device_count_label.grid(row=0, column=1, sticky="e", padx=10)
-        self.scan_btn = ttk.Button(top, text="Scan Network", command=self.start_scan, width=16)
-        self.scan_btn.grid(row=0, column=2, sticky="e")
+        # ── Left panel: device list ────────────────────────────────────
+        left = ttk.Frame(parent, padding=(8, 8, 4, 8))
+        left.grid(row=0, column=0, sticky="nsew")
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
 
-        # Device list
-        lf = ttk.LabelFrame(parent, text="Connected Devices", padding=5)
-        lf.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
+        scan_bar = ttk.Frame(left)
+        scan_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        scan_bar.columnconfigure(1, weight=1)
+        self.scan_btn = ttk.Button(scan_bar, text="Scan Network",
+                                    command=self.start_scan, width=16)
+        self.scan_btn.grid(row=0, column=0)
+        self.device_count_label = ttk.Label(scan_bar, text="Devices found: 0",
+                                             foreground="#555")
+        self.device_count_label.grid(row=0, column=1, sticky="e")
+
+        lf = ttk.LabelFrame(left, text="Connected Devices", padding=4)
+        lf.grid(row=1, column=0, sticky="nsew")
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
 
         cols = ("IP Address", "Device Name", "Status")
-        self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="extended")
+        self.tree = ttk.Treeview(lf, columns=cols, show="headings",
+                                  selectmode="extended")
         self.tree.heading("IP Address",  text="IP Address")
         self.tree.heading("Device Name", text="Device Name")
         self.tree.heading("Status",      text="Status")
-        self.tree.column("IP Address",  width=140, minwidth=120)
-        self.tree.column("Device Name", width=220, minwidth=150)
-        self.tree.column("Status",      width=480, minwidth=200)
-        self.tree.tag_configure("done",      background="#d4edda", foreground="#155724")
-        self.tree.tag_configure("skipped",   background="#e2e3e5", foreground="#383d41")
-        self.tree.tag_configure("uploading", background="#fff3cd", foreground="#856404")
-        self.tree.tag_configure("checking",  background="#d1ecf1", foreground="#0c5460")
-        self.tree.tag_configure("error",     background="#f8d7da", foreground="#721c24")
+        self.tree.column("IP Address",  width=130, minwidth=100)
+        self.tree.column("Device Name", width=200, minwidth=130)
+        self.tree.column("Status",      width=340, minwidth=180)
+        for tag, bg, fg in (
+            ("done",      "#1a3d2b", "#00bc8c"),
+            ("skipped",   "#2a2a2a", "#888888"),
+            ("uploading", "#3d2e00", "#f39c12"),
+            ("checking",  "#0d2233", "#3498db"),
+            ("error",     "#3d1010", "#e74c3c"),
+        ):
+            self.tree.tag_configure(tag, background=bg, foreground=fg)
         self.tree.bind("<<TreeviewSelect>>", self._on_selection_change)
         self.tree.bind("<Double-1>", self._on_device_double_click)
-
         vsc = ttk.Scrollbar(lf, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsc.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
         vsc.grid(row=0, column=1, sticky="ns")
 
-        sel_bar = ttk.Frame(lf)
-        sel_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        ttk.Button(sel_bar, text="Select All",   command=self._select_all,   width=14).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Button(sel_bar, text="Deselect All", command=self._deselect_all, width=14).pack(side=tk.LEFT)
-        self.selected_label = ttk.Label(sel_bar, text="Selected: 0 / 0")
+        sel_bar = ttk.Frame(left)
+        sel_bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(sel_bar, text="Select All",   command=self._select_all,
+                   width=13).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(sel_bar, text="Deselect All", command=self._deselect_all,
+                   width=13).pack(side=tk.LEFT)
+        self.selected_label = ttk.Label(sel_bar, text="Selected: 0 / 0",
+                                         foreground="#555")
         self.selected_label.pack(side=tk.RIGHT)
 
-        # Settings area
-        settings = ttk.Frame(parent, padding=(10, 4))
-        settings.grid(row=2, column=0, sticky="ew")
-        settings.columnconfigure(0, weight=1)
+        prog_frame = ttk.Frame(left)
+        prog_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        prog_frame.columnconfigure(0, weight=1)
+        self.progress_var = tk.DoubleVar()
+        ttk.Progressbar(prog_frame, variable=self.progress_var,
+                        maximum=100).grid(
+            row=0, column=0, sticky="ew", pady=(0, 4))
+        self.status_label = ttk.Label(
+            prog_frame, text="Ready — scan the network to find devices.",
+            foreground="#555")
+        self.status_label.grid(row=1, column=0, sticky="w")
 
-        # --- Upload files ---
-        files_frame = ttk.LabelFrame(settings, text="Video Files to Upload", padding=5)
-        files_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        # ── Right panel: operations ────────────────────────────────────
+        right = ttk.Frame(parent, padding=(4, 8, 8, 8))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        r = 0
+
+        # Files to upload
+        files_frame = ttk.LabelFrame(right, text="Files to Upload", padding=6)
+        files_frame.grid(row=r, column=0, sticky="ew"); r += 1
         files_frame.columnconfigure(0, weight=1)
-        self.file_listbox = tk.Listbox(files_frame, height=3, selectmode=tk.EXTENDED, activestyle="none")
-        hsc = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL, command=self.file_listbox.xview)
+        self.file_listbox = tk.Listbox(
+            files_frame, height=3, selectmode=tk.EXTENDED, activestyle="none",
+            background="#2d2d2d",
+            foreground="#ffffff",
+            selectbackground="#0078d4",
+            selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground="#3d3d3d",
+            highlightcolor="#0078d4",
+        )
+        hsc = ttk.Scrollbar(files_frame, orient=tk.HORIZONTAL,
+                             command=self.file_listbox.xview)
         self.file_listbox.configure(xscrollcommand=hsc.set)
         self.file_listbox.grid(row=0, column=0, sticky="ew")
         hsc.grid(row=1, column=0, sticky="ew")
         fb = ttk.Frame(files_frame)
-        fb.grid(row=0, column=1, sticky="n", padx=(6, 0))
-        ttk.Button(fb, text="Add Files",  command=self._add_files,             width=12).pack(pady=2)
-        ttk.Button(fb, text="Remove",     command=self._remove_selected_files,  width=12).pack(pady=2)
-        ttk.Button(fb, text="Clear All",  command=self._clear_files,            width=12).pack(pady=2)
+        fb.grid(row=0, column=1, sticky="n", padx=(4, 0))
+        ttk.Button(fb, text="Add",    command=self._add_files,             width=8).pack(pady=1)
+        ttk.Button(fb, text="Remove", command=self._remove_selected_files,  width=8).pack(pady=1)
+        ttk.Button(fb, text="Clear",  command=self._clear_files,            width=8).pack(pady=1)
 
-        # --- Delete file ---
-        del_frame = ttk.LabelFrame(settings, text="Delete File from Devices", padding=5)
-        del_frame.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        del_frame.columnconfigure(1, weight=1)
-        ttk.Label(del_frame, text="Filename:", width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        # Primary upload action
+        self.upload_btn = ttk.Button(right, text="Upload to Selected Devices",
+                                      command=self.start_upload,
+                                      state=tk.DISABLED, style="Accent.TButton")
+        self.upload_btn.grid(row=r, column=0, sticky="ew", pady=(6, 10)); r += 1
+
+        ttk.Separator(right, orient=tk.HORIZONTAL).grid(
+            row=r, column=0, sticky="ew", pady=(0, 8)); r += 1
+
+        # Delete file
+        del_frame = ttk.LabelFrame(right, text="Delete File from Devices", padding=6)
+        del_frame.grid(row=r, column=0, sticky="ew"); r += 1
+        del_frame.columnconfigure(0, weight=1)
         self.delete_var = tk.StringVar()
-        ttk.Entry(del_frame, textvariable=self.delete_var).grid(row=0, column=1, sticky="ew", padx=5)
-        self.delete_btn = ttk.Button(del_frame, text="Delete from Selected",
-                                      command=self._delete_from_devices, width=22)
-        self.delete_btn.grid(row=0, column=2)
+        ttk.Entry(del_frame, textvariable=self.delete_var).grid(
+            row=0, column=0, sticky="ew", pady=(0, 4))
+        self.delete_btn = ttk.Button(del_frame,
+                                      text="Delete from Selected Devices",
+                                      command=self._delete_from_devices)
+        self.delete_btn.grid(row=1, column=0, sticky="ew")
 
-        # --- APK Installation ---
-        apk_frame = ttk.LabelFrame(settings, text="APK Installation", padding=5)
-        apk_frame.grid(row=2, column=0, sticky="ew", pady=(0, 6))
-        apk_frame.columnconfigure(1, weight=1)
-        ttk.Label(apk_frame, text="APK File:", width=12, anchor="w").grid(row=0, column=0, sticky="w")
+        ttk.Separator(right, orient=tk.HORIZONTAL).grid(
+            row=r, column=0, sticky="ew", pady=8); r += 1
+
+        # APK installation
+        apk_frame = ttk.LabelFrame(right, text="APK Installation", padding=6)
+        apk_frame.grid(row=r, column=0, sticky="ew"); r += 1
+        apk_frame.columnconfigure(0, weight=1)
         self.apk_var = tk.StringVar()
-        self.apk_combo = ttk.Combobox(apk_frame, textvariable=self.apk_var, state="readonly", width=40)
-        self.apk_combo.grid(row=0, column=1, sticky="ew", padx=5)
-        ttk.Button(apk_frame, text="Refresh", command=self._scan_apk_folder, width=8).grid(row=0, column=2, padx=(0, 4))
-        ttk.Button(apk_frame, text="Browse",  command=self._browse_apk,       width=8).grid(row=0, column=3)
-        self.install_btn = ttk.Button(apk_frame, text="Install on Selected Devices",
-                                       command=self._install_apk, width=26)
-        self.install_btn.grid(row=1, column=0, columnspan=4, sticky="e", pady=(6, 0))
+        apk_top = ttk.Frame(apk_frame)
+        apk_top.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        apk_top.columnconfigure(0, weight=1)
+        self.apk_combo = ttk.Combobox(apk_top, textvariable=self.apk_var,
+                                       state="readonly")
+        self.apk_combo.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ttk.Button(apk_top, text="Refresh", command=self._scan_apk_folder,
+                   width=8).grid(row=0, column=1, padx=(0, 2))
+        ttk.Button(apk_top, text="Browse",  command=self._browse_apk,
+                   width=8).grid(row=0, column=2)
+        self.install_btn = ttk.Button(apk_frame,
+                                       text="Install on Selected Devices",
+                                       command=self._install_apk)
+        self.install_btn.grid(row=1, column=0, sticky="ew")
 
-        # --- Dest + concurrent ---
-        opt_row = ttk.Frame(settings)
-        opt_row.grid(row=3, column=0, sticky="ew")
-        opt_row.columnconfigure(1, weight=1)
-        ttk.Label(opt_row, text="Dest Folder:", width=14, anchor="w").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Separator(right, orient=tk.HORIZONTAL).grid(
+            row=r, column=0, sticky="ew", pady=8); r += 1
+
+        # Options
+        opt_frame = ttk.LabelFrame(right, text="Options", padding=6)
+        opt_frame.grid(row=r, column=0, sticky="ew"); r += 1
+        opt_frame.columnconfigure(1, weight=1)
+        ttk.Label(opt_frame, text="Destination:").grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
         self.dest_var = tk.StringVar(value="/sdcard/Showtime VR/Videos/3D")
-        ttk.Entry(opt_row, textvariable=self.dest_var).grid(row=0, column=1, sticky="ew", padx=5)
-        self.discover_btn = ttk.Button(opt_row, text="Discover", command=self._discover_path, width=10)
-        self.discover_btn.grid(row=0, column=2, sticky="e")
-        ttk.Label(opt_row, text="Concurrent:", width=14, anchor="w").grid(row=1, column=0, sticky="w", pady=3)
-        batch_row = ttk.Frame(opt_row)
-        batch_row.grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Entry(opt_frame, textvariable=self.dest_var).grid(
+            row=0, column=1, sticky="ew", padx=(4, 4), pady=(0, 4))
+        self.discover_btn = ttk.Button(opt_frame, text="Discover",
+                                        command=self._discover_path, width=9)
+        self.discover_btn.grid(row=0, column=2, pady=(0, 4))
+        ttk.Label(opt_frame, text="Concurrent:").grid(row=1, column=0, sticky="w")
         self.batch_var = tk.IntVar(value=30)
-        ttk.Spinbox(batch_row, from_=1, to=300, textvariable=self.batch_var, width=8).pack(side=tk.LEFT)
-        ttk.Label(batch_row, text="simultaneous operations").pack(side=tk.LEFT, padx=6)
+        b_row = ttk.Frame(opt_frame)
+        b_row.grid(row=1, column=1, columnspan=2, sticky="w", padx=4)
+        ttk.Spinbox(b_row, from_=1, to=300, textvariable=self.batch_var,
+                    width=5).pack(side=tk.LEFT)
+        ttk.Label(b_row, text="simultaneous").pack(side=tk.LEFT, padx=4)
 
-        # Bottom bar
-        bottom = ttk.Frame(parent, padding=(10, 6))
-        bottom.grid(row=3, column=0, sticky="ew")
-        bottom.columnconfigure(0, weight=1)
-        self.progress_var = tk.DoubleVar()
-        ttk.Progressbar(bottom, variable=self.progress_var, maximum=100).grid(
-            row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        self.status_label = ttk.Label(bottom, text="Ready — scan the network to find devices.")
-        self.status_label.grid(row=1, column=0, sticky="w")
-        self.upload_btn = ttk.Button(bottom, text="Upload to Selected Devices",
-                                      command=self.start_upload, state=tk.DISABLED, width=24)
-        self.upload_btn.grid(row=1, column=1, sticky="e")
-
-        # Scan for APKs now that all buttons exist
         self._scan_apk_folder()
 
     # ------------------------------------------------------------------

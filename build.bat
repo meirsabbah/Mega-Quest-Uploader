@@ -1,6 +1,6 @@
 @echo off
-echo Installing PyInstaller...
-pip install pyinstaller
+echo Installing dependencies...
+pip install pyinstaller sv-ttk
 
 echo.
 echo Detecting Python installation path...
@@ -25,6 +25,7 @@ python -m PyInstaller --onefile --windowed ^
   --add-data "%PYPREFIX%\tcl\tcl8.6;tcl" ^
   --add-data "%PYPREFIX%\tcl\tk8.6;tk" ^
   --collect-all tkinter ^
+  --collect-all sv_ttk ^
   uploader.py
 
 echo.
