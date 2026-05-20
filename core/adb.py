@@ -119,32 +119,19 @@ def enable_wifi_adb(adb_path, serial):
 # ---------------------------------------------------------------------------
 
 def get_local_subnet():
-    import ipaddress
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
     finally:
         s.close()
-    # Read the real subnet mask from ipconfig so a /23 (or other non-/24)
-    # network is scanned correctly instead of being silently truncated.
-    try:
-        r = subprocess.run(["ipconfig"], capture_output=True, text=True,
-                           timeout=5, creationflags=_NO_WINDOW)
-        lines = r.stdout.splitlines()
-        for i, line in enumerate(lines):
-            if local_ip in line:
-                for nearby in lines[max(0, i - 3):i + 4]:
-                    if "255." in nearby and ":" in nearby:
-                        mask = nearby.split(":")[-1].strip()
-                        try:
-                            net = ipaddress.IPv4Network(f"{local_ip}/{mask}", strict=False)
-                            return str(net)
-                        except Exception:
-                            pass
-    except Exception:
-        pass
-    return local_ip.rsplit(".", 1)[0] + ".0/24"
+    # Always scan a /23 by rounding the third octet down to even.
+    # This covers both halves of a /23 network (e.g. .100.x and .101.x)
+    # without needing to detect the actual subnet mask.
+    # Scanning 510 addresses instead of 254 adds only ~2 s with 100 workers.
+    parts = local_ip.split(".")
+    third = int(parts[2]) & ~1  # round down to even: 101→100, 100→100
+    return f"{parts[0]}.{parts[1]}.{third}.0/23"
 
 
 def probe_device(adb_path, ip_str):
