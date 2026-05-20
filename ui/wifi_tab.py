@@ -356,7 +356,10 @@ class WifiTab:
 
     def _scan_worker(self):
         try:
-            hosts = list(ipaddress.IPv4Network(adb.get_local_subnet(), strict=False).hosts())
+            subnet = adb.get_local_subnet()
+            hosts = list(ipaddress.IPv4Network(subnet, strict=False).hosts())
+            self.root.after(0, self.status_label.config,
+                            {"text": f"Scanning {subnet} ({len(hosts)} addresses)..."})
 
             def probe(ip):
                 result = adb.probe_device(self.adb_path, str(ip))
