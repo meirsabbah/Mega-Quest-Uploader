@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.1.4"
+VERSION = "1.1.5"
 
 import tkinter as tk
 from tkinter import ttk
