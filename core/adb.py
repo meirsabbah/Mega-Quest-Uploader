@@ -179,9 +179,8 @@ def file_exists_on_device(adb_path, ip, remote_file, local_size):
 
 def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
     """
-    Push a single file. Calls progress_cb(pct) with 0-100 during transfer.
-    Progress is tracked by polling the remote file size every 3 seconds
-    (ADB suppresses its terminal progress output when stdout is piped).
+    Push a single file with up to 2 automatic retries on failure.
+    Progress is tracked by polling the remote file size every 30 seconds.
     Returns (success: bool, error_str: str).
     """
     subprocess.run(
@@ -195,43 +194,47 @@ def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
     except OSError:
         local_size = 0
 
-    stop = threading.Event()
+    last_err = ""
+    for attempt in range(3):
+        stop = threading.Event()
 
-    def _poll():
-        progress_cb(0)
-        while not stop.wait(3.0):
-            try:
-                r = subprocess.run(
-                    [adb_path, "-s", f"{ip}:5555", "shell",
-                     f'stat -c%s "{remote_file}" 2>/dev/null || echo 0'],
-                    capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
-                )
-                out = r.stdout.strip()
-                if out and out.isdigit() and local_size > 0:
-                    pct = min(99, int(int(out) / local_size * 100))
-                    progress_cb(pct)
-            except Exception:
-                pass
+        def _poll():
+            progress_cb(0)
+            while not stop.wait(30.0):
+                try:
+                    r = subprocess.run(
+                        [adb_path, "-s", f"{ip}:5555", "shell",
+                         f'stat -c%s "{remote_file}" 2>/dev/null || echo 0'],
+                        capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+                    )
+                    out = r.stdout.strip()
+                    if out and out.isdigit() and local_size > 0:
+                        pct = min(99, int(int(out) / local_size * 100))
+                        progress_cb(pct)
+                except Exception:
+                    pass
 
-    t = threading.Thread(target=_poll, daemon=True)
-    t.start()
-    try:
-        proc = subprocess.Popen(
-            [adb_path, "-s", f"{ip}:5555", "push", file_path, dest_dir],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            creationflags=_NO_WINDOW,
-        )
-        proc.wait()
-        stop.set()
-        t.join(timeout=8)
-        if proc.returncode == 0:
-            progress_cb(100)
-            return True, ""
-        err = (proc.stdout.read() if proc.stdout else b"").decode("utf-8", errors="replace").strip()
-        return False, err or f"adb exit {proc.returncode}"
-    except Exception as e:
-        stop.set()
-        return False, str(e)
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
+        try:
+            proc = subprocess.Popen(
+                [adb_path, "-s", f"{ip}:5555", "push", file_path, dest_dir],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                creationflags=_NO_WINDOW,
+            )
+            proc.wait()
+            stop.set()
+            t.join(timeout=8)
+            if proc.returncode == 0:
+                progress_cb(100)
+                return True, ""
+            last_err = (proc.stdout.read() if proc.stdout else b"").decode("utf-8", errors="replace").strip()
+            last_err = last_err or f"adb exit {proc.returncode}"
+        except Exception as e:
+            stop.set()
+            last_err = str(e)
+
+    return False, last_err
 
 
 def delete_file_from_device(adb_path, ip, remote_file):

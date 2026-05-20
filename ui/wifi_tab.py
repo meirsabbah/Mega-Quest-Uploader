@@ -72,9 +72,11 @@ class WifiTab:
 
         cols = ("IP Address", "Device Name", "Status")
         self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="extended")
-        self.tree.heading("IP Address",  text="IP Address")
-        self.tree.heading("Device Name", text="Device Name")
-        self.tree.heading("Status",      text="Status")
+        self._sort_col = None
+        self._sort_asc = True
+        for col in cols:
+            self.tree.heading(col, text=col,
+                              command=lambda c=col: self._sort_by(c))
         self.tree.column("IP Address",  width=130, minwidth=100)
         self.tree.column("Device Name", width=200, minwidth=130)
         self.tree.column("Status",      width=340, minwidth=180)
@@ -281,6 +283,21 @@ class WifiTab:
     # ------------------------------------------------------------------
     # Device selection
     # ------------------------------------------------------------------
+
+    def _sort_by(self, col):
+        if self._sort_col == col:
+            self._sort_asc = not self._sort_asc
+        else:
+            self._sort_col = col
+            self._sort_asc = True
+        items = [(self.tree.set(iid, col), iid) for iid in self.tree.get_children()]
+        items.sort(key=lambda x: x[0].lower(), reverse=not self._sort_asc)
+        for rank, (_, iid) in enumerate(items):
+            self.tree.move(iid, "", rank)
+        arrow = " ▲" if self._sort_asc else " ▼"
+        for c in ("IP Address", "Device Name", "Status"):
+            self.tree.heading(c, text=c + (arrow if c == col else ""),
+                              command=lambda cc=c: self._sort_by(cc))
 
     def _select_all(self):
         self.tree.selection_set(self.tree.get_children())
