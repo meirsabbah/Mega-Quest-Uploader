@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tcl8.6', 'tcl'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tk8.6', 'tk')]
+datas = [('icon.ico', '.'), ('quest_uploader_logo.png', '.'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tcl8.6', 'tcl'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tk8.6', 'tk')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('tkinter')
@@ -44,4 +44,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['icon.ico'],
 )
