@@ -185,23 +185,28 @@ def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
             creationflags=_NO_WINDOW,
         )
         # adb uses \r (not \n) for progress lines, so read byte-by-byte
+        import re, tempfile, os
+        _pct_re = re.compile(r'(\d+)%')
+        _dbg_path = os.path.join(tempfile.gettempdir(), "adb_push_debug.txt")
         buf = bytearray()
-        while True:
-            b = proc.stdout.read(1)
-            if not b:
-                break
-            if b in (b"\r", b"\n"):
-                if buf:
-                    line = buf.decode("utf-8", errors="replace").strip()
-                    if line.startswith("[") and "%" in line:
-                        try:
-                            pct = int(line.split("%")[0].strip("[").strip())
-                            progress_cb(pct)
-                        except ValueError:
-                            pass
-                    buf.clear()
-            else:
-                buf.extend(b)
+        with open(_dbg_path, "w", encoding="utf-8") as _dbg:
+            while True:
+                b = proc.stdout.read(1)
+                if not b:
+                    break
+                if b in (b"\r", b"\n"):
+                    if buf:
+                        line = buf.decode("utf-8", errors="replace").strip()
+                        _dbg.write(repr(line) + "\n")
+                        _dbg.flush()
+                        m = _pct_re.search(line)
+                        if m:
+                            pct = int(m.group(1))
+                            if 0 <= pct <= 100:
+                                progress_cb(pct)
+                        buf.clear()
+                else:
+                    buf.extend(b)
         proc.wait()
         if proc.returncode == 0:
             return True, ""
