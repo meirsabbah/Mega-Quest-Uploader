@@ -184,14 +184,24 @@ def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
             creationflags=_NO_WINDOW,
         )
-        for raw_line in proc.stdout:
-            line = raw_line.decode("utf-8", errors="replace").strip()
-            if line.startswith("[") and "%" in line:
-                try:
-                    pct = int(line.split("%")[0].strip("[").strip())
-                    progress_cb(pct)
-                except ValueError:
-                    pass
+        # adb uses \r (not \n) for progress lines, so read byte-by-byte
+        buf = bytearray()
+        while True:
+            b = proc.stdout.read(1)
+            if not b:
+                break
+            if b in (b"\r", b"\n"):
+                if buf:
+                    line = buf.decode("utf-8", errors="replace").strip()
+                    if line.startswith("[") and "%" in line:
+                        try:
+                            pct = int(line.split("%")[0].strip("[").strip())
+                            progress_cb(pct)
+                        except ValueError:
+                            pass
+                    buf.clear()
+            else:
+                buf.extend(b)
         proc.wait()
         if proc.returncode == 0:
             return True, ""

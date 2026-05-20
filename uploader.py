@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Quest Mass Uploader — push/delete video files on Quest headsets simultaneously over WiFi."""
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 import tkinter as tk
 from tkinter import ttk
@@ -20,6 +20,7 @@ class QuestUploader:
         self.root.title(f"Quest Mass Uploader  v{VERSION}")
         self.root.geometry("1060x720")
         self.root.minsize(860, 540)
+        self.root.state("zoomed")
         self.root.protocol("WM_DELETE_WINDOW",
                            on_back if on_back else self._on_close)
 

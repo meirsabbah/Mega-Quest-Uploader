@@ -28,6 +28,7 @@ class WifiTab:
         self.apk_var      = tk.StringVar()
         self.batch_var    = tk.IntVar(value=30)
         self.progress_var = tk.DoubleVar()
+        self._device_progress = {}  # ip -> 0-100, tracks smooth per-device progress
 
         self._build(parent)
 
@@ -387,6 +388,17 @@ class WifiTab:
     # Upload
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _make_bar(pct, width=10):
+        filled = round(pct / 100 * width)
+        return "█" * filled + "░" * (width - filled)
+
+    def _update_overall_bar(self):
+        if not self._device_progress:
+            return
+        avg = sum(self._device_progress.values()) / len(self._device_progress)
+        self.progress_var.set(avg)
+
     def start_upload(self):
         selected_ips = self._get_selected_ips()
         if not selected_ips or not self.file_paths:
@@ -396,6 +408,7 @@ class WifiTab:
         self._refresh_buttons()
         for ip in selected_ips:
             self._set_status(ip, "Waiting...", "")
+        self._device_progress = {ip: 0.0 for ip in selected_ips}
         self.progress_var.set(0)
         threading.Thread(
             target=self._upload_worker,
@@ -421,8 +434,12 @@ class WifiTab:
 
             self.root.after(0, self._set_status, ip, f"{prefix}Starting upload...", "uploading")
 
-            def _progress(pct, _ip=ip, _prefix=prefix):
-                self.root.after(0, self._set_status, _ip, f"{_prefix}Uploading {pct}%", "uploading")
+            def _progress(pct, _ip=ip, _prefix=prefix, _i=i, _n=n):
+                device_pct = (_i * 100 + pct) / _n
+                self._device_progress[_ip] = device_pct
+                bar = WifiTab._make_bar(pct)
+                self.root.after(0, self._set_status, _ip, f"{_prefix}[{bar}] {pct}%", "uploading")
+                self.root.after(0, self._update_overall_bar)
 
             success, error = adb.push_file(self.adb_path, ip, file_path, dest_dir, _progress)
             if success:
@@ -441,6 +458,8 @@ class WifiTab:
         final = " | ".join(parts) if parts else "Done"
         self.root.after(0, self._set_status, ip, final,
                         "error" if errors else ("skipped" if not uploaded else "done"))
+        self._device_progress[ip] = 100.0
+        self.root.after(0, self._update_overall_bar)
         self._tick_progress(counter, total, lock, "uploaded")
 
     def _upload_worker(self, selected_ips, file_paths):
