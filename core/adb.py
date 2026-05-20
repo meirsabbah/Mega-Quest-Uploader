@@ -1,10 +1,10 @@
 """All ADB / subprocess operations — no tkinter imports."""
 
 import os
-import re
 import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -173,42 +173,57 @@ def file_exists_on_device(adb_path, ip, remote_file, local_size):
 def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
     """
     Push a single file. Calls progress_cb(pct) with 0-100 during transfer.
+    Progress is tracked by polling the remote file size every 3 seconds
+    (ADB suppresses its terminal progress output when stdout is piped).
     Returns (success: bool, error_str: str).
     """
     subprocess.run(
         [adb_path, "-s", f"{ip}:5555", "shell", f'mkdir -p "{dest_dir}"'],
         capture_output=True, timeout=15, creationflags=_NO_WINDOW,
     )
+    filename = Path(file_path).name
+    remote_file = dest_dir.rstrip("/") + "/" + filename
+    try:
+        local_size = os.path.getsize(file_path)
+    except OSError:
+        local_size = 0
+
+    stop = threading.Event()
+
+    def _poll():
+        progress_cb(0)
+        while not stop.wait(3.0):
+            try:
+                r = subprocess.run(
+                    [adb_path, "-s", f"{ip}:5555", "shell",
+                     f'stat -c%s "{remote_file}" 2>/dev/null || echo 0'],
+                    capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
+                )
+                out = r.stdout.strip()
+                if out and out.isdigit() and local_size > 0:
+                    pct = min(99, int(int(out) / local_size * 100))
+                    progress_cb(pct)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_poll, daemon=True)
+    t.start()
     try:
         proc = subprocess.Popen(
             [adb_path, "-s", f"{ip}:5555", "push", file_path, dest_dir],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             creationflags=_NO_WINDOW,
         )
-        # adb uses \r (not \n) for progress lines, so read byte-by-byte
-        import re
-        _pct_re = re.compile(r'(\d+)%')
-        buf = bytearray()
-        while True:
-            b = proc.stdout.read(1)
-            if not b:
-                break
-            if b in (b"\r", b"\n"):
-                if buf:
-                    line = buf.decode("utf-8", errors="replace").strip()
-                    m = _pct_re.search(line)
-                    if m:
-                        pct = int(m.group(1))
-                        if 0 <= pct <= 100:
-                            progress_cb(pct)
-                    buf.clear()
-            else:
-                buf.extend(b)
         proc.wait()
+        stop.set()
+        t.join(timeout=8)
         if proc.returncode == 0:
+            progress_cb(100)
             return True, ""
-        return False, f"adb exit {proc.returncode}"
+        err = (proc.stdout.read() if proc.stdout else b"").decode("utf-8", errors="replace").strip()
+        return False, err or f"adb exit {proc.returncode}"
     except Exception as e:
+        stop.set()
         return False, str(e)
 
 
