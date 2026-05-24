@@ -34,8 +34,10 @@ class UsbTab:
         ttk.Label(
             parent,
             text=(
-                "Plug headsets in via USB. Accept the 'Allow USB Debugging' prompt on each "
-                "headset. Once enabled, the headset is discoverable over WiFi — safe to unplug."
+                "Plug headsets in via USB. When the 'Allow USB Debugging' prompt appears on the "
+                "headset, tap Allow and check 'Always allow from this computer' — you only need "
+                "to do this once per headset. After that, WiFi ADB is enabled permanently and "
+                "the headset is reachable over WiFi even after reboots."
             ),
             wraplength=800, justify=tk.LEFT,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
