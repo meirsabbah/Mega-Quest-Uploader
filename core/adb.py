@@ -101,24 +101,14 @@ def get_device_info_usb(adb_path, serial):
 # ---------------------------------------------------------------------------
 
 def enable_wifi_adb(adb_path, serial):
-    """Returns (success: bool, message: str).
-
-    Also sets persist.adb.tcp.port so the device keeps listening on 5555
-    after every reboot — no USB needed again (as long as 'Always allow'
-    was checked when the USB Debugging dialog appeared on the headset).
-    """
+    """Returns (success: bool, message: str)."""
     try:
-        # Make TCP mode survive reboots (works on Quest in developer mode)
-        subprocess.run(
-            [adb_path, "-s", serial, "shell", "setprop persist.adb.tcp.port 5555"],
-            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
-        )
         r = subprocess.run(
             [adb_path, "-s", serial, "tcpip", "5555"],
             capture_output=True, text=True, timeout=15, creationflags=_NO_WINDOW,
         )
         if r.returncode == 0:
-            return True, "WiFi ADB enabled permanently — safe to unplug"
+            return True, "WiFi ADB enabled — safe to unplug"
         return False, f"Failed: {(r.stderr or r.stdout).strip()}"
     except Exception as e:
         return False, f"Error: {e}"

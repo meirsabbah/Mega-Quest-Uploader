@@ -12,6 +12,7 @@ class UsbTab:
         self.app = app              # exposes app.root, app.adb_path
         self.usb_devices = {}       # serial -> {name, state, status, item_id}
         self.auto_enable_var = tk.BooleanVar(value=True)
+        self._refreshing = False    # prevents overlapping poll threads
         self._build(parent)
 
     # Convenience properties so the rest of the class doesn't reach through app
@@ -34,10 +35,12 @@ class UsbTab:
         ttk.Label(
             parent,
             text=(
-                "Plug headsets in via USB. When the 'Allow USB Debugging' prompt appears on the "
-                "headset, tap Allow and check 'Always allow from this computer' — you only need "
-                "to do this once per headset. After that, WiFi ADB is enabled permanently and "
-                "the headset is reachable over WiFi even after reboots."
+                "Plug headsets in via USB. When the 'Allow USB Debugging' prompt appears, "
+                "tap Allow and check 'Always allow from this computer' — this only needs to "
+                "be done once per headset. WiFi ADB must be re-enabled once after each reboot: "
+                "plug in via USB and click Enable All. "
+                "Quest 3 tip: enable 'Wireless Debugging' in Developer Settings on the headset "
+                "to skip USB entirely after reboots."
             ),
             wraplength=800, justify=tk.LEFT,
         ).grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -78,7 +81,7 @@ class UsbTab:
         ttk.Button(bf, text="Enable All",     command=self._enable_all, width=14).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(bf, text="Detect Devices", command=self.refresh,     width=16).pack(side=tk.RIGHT)
 
-        self.status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
+        self.status_label = ttk.Label(parent, text="Monitoring for USB connections...")
         self.status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
     # ------------------------------------------------------------------
@@ -128,19 +131,26 @@ class UsbTab:
     # ------------------------------------------------------------------
 
     def refresh(self):
-        if self.adb_path:
+        if self.adb_path and not self._refreshing:
             threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
-        current = adb.get_usb_devices_raw(self.adb_path)
-        for serial, state in current.items():
-            if serial not in self.usb_devices:
-                self.root.after(0, self.on_appeared, serial, state)
-        for serial in list(self.usb_devices.keys()):
-            if serial not in current:
-                self.root.after(0, self.on_removed, serial)
+        self._refreshing = True
+        try:
+            current = adb.get_usb_devices_raw(self.adb_path)
+            for serial, state in current.items():
+                if serial not in self.usb_devices:
+                    self.root.after(0, self.on_appeared, serial, state)
+                elif state == "device" and self.usb_devices[serial]["state"] == "unauthorized":
+                    # Device just got authorized on the headset — enable without needing a restart
+                    self.root.after(0, self.on_authorized, serial)
+            for serial in list(self.usb_devices.keys()):
+                if serial not in current:
+                    self.root.after(0, self.on_removed, serial)
+        finally:
+            self._refreshing = False
 
-    def _enable_all(self):
+def _enable_all(self):
         targets = [s for s, d in self.usb_devices.items() if d["state"] == "device"]
         if not targets:
             messagebox.showinfo(
