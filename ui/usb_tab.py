@@ -81,7 +81,7 @@ class UsbTab:
         ttk.Button(bf, text="Enable All",     command=self._enable_all, width=14).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(bf, text="Detect Devices", command=self.refresh,     width=16).pack(side=tk.RIGHT)
 
-        self.status_label = ttk.Label(parent, text="Monitoring for USB connections...")
+        self.status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
         self.status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
     # ------------------------------------------------------------------
@@ -150,7 +150,7 @@ class UsbTab:
         finally:
             self._refreshing = False
 
-def _enable_all(self):
+    def _enable_all(self):
         targets = [s for s, d in self.usb_devices.items() if d["state"] == "device"]
         if not targets:
             messagebox.showinfo(

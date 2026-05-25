@@ -126,12 +126,14 @@ class NitzFlash:
     def _launch_quest(self):
         for w in self.root.winfo_children():
             w.destroy()
+        self.root.resizable(True, True)
         from uploader import QuestUploader
         QuestUploader(self.root, on_back=self._show_hub)
 
     def _launch_encrypter(self):
         for w in self.root.winfo_children():
             w.destroy()
+        self.root.resizable(True, True)
         from video_encrypter.setup_usb import VideoEncrypterApp
         VideoEncrypterApp(self.root, on_back=self._show_hub)
 
