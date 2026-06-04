@@ -5,9 +5,32 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+
+def _ensure_connected(adb_path, ip):
+    """Reconnect to ip:5555, forcing a fresh connect if the entry is offline."""
+    serial = f"{ip}:5555"
+    subprocess.run(
+        [adb_path, "connect", serial],
+        capture_output=True, timeout=10, creationflags=_NO_WINDOW,
+    )
+    state_r = subprocess.run(
+        [adb_path, "-s", serial, "get-state"],
+        capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
+    )
+    if state_r.stdout.strip() != "device":
+        subprocess.run(
+            [adb_path, "disconnect", serial],
+            capture_output=True, timeout=5, creationflags=_NO_WINDOW,
+        )
+        subprocess.run(
+            [adb_path, "connect", serial],
+            capture_output=True, timeout=10, creationflags=_NO_WINDOW,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +123,12 @@ def get_device_info_usb(adb_path, serial):
 # USB → WiFi ADB
 # ---------------------------------------------------------------------------
 
+def restart_adb_server(adb_path):
+    """Kill and restart the ADB server. Forces re-authorization on all connected devices."""
+    subprocess.run([adb_path, "kill-server"],  capture_output=True, timeout=10, creationflags=_NO_WINDOW)
+    subprocess.run([adb_path, "start-server"], capture_output=True, timeout=15, creationflags=_NO_WINDOW)
+
+
 def enable_wifi_adb(adb_path, serial):
     """Returns (success: bool, message: str)."""
     try:
@@ -149,11 +178,39 @@ def probe_device(adb_path, ip_str):
         )
         if "connected" not in r.stdout.lower():
             return None
-        model_r = subprocess.run(
-            [adb_path, "-s", f"{ip_str}:5555", "shell", "getprop ro.product.model"],
-            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+        # If the entry was already in ADB's list as offline, force a clean reconnect.
+        state_r = subprocess.run(
+            [adb_path, "-s", f"{ip_str}:5555", "get-state"],
+            capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
         )
-        model = model_r.stdout.strip() or "Unknown"
+        if state_r.stdout.strip() != "device":
+            subprocess.run(
+                [adb_path, "disconnect", f"{ip_str}:5555"],
+                capture_output=True, timeout=5, creationflags=_NO_WINDOW,
+            )
+            r2 = subprocess.run(
+                [adb_path, "connect", f"{ip_str}:5555"],
+                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+            )
+            if "connected" not in r2.stdout.lower():
+                return None
+            state_r2 = subprocess.run(
+                [adb_path, "-s", f"{ip_str}:5555", "get-state"],
+                capture_output=True, text=True, timeout=5, creationflags=_NO_WINDOW,
+            )
+            if state_r2.stdout.strip() != "device":
+                return None
+        model = ""
+        for _ in range(3):
+            model_r = subprocess.run(
+                [adb_path, "-s", f"{ip_str}:5555", "shell", "getprop ro.product.model"],
+                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+            )
+            model = model_r.stdout.strip()
+            if model:
+                break
+            time.sleep(0.4)
+        model = model or "Unknown"
         name = get_showtime_name(adb_path, f"{ip_str}:5555") or model
         return model, name
     except Exception:
@@ -165,6 +222,7 @@ def probe_device(adb_path, ip_str):
 # ---------------------------------------------------------------------------
 
 def file_exists_on_device(adb_path, ip, remote_file, local_size):
+    _ensure_connected(adb_path, ip)
     try:
         r = subprocess.run(
             [adb_path, "-s", f"{ip}:5555", "shell",
@@ -183,6 +241,7 @@ def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
     Progress is tracked by polling the remote file size every 30 seconds.
     Returns (success: bool, error_str: str).
     """
+    _ensure_connected(adb_path, ip)
     subprocess.run(
         [adb_path, "-s", f"{ip}:5555", "shell", f'mkdir -p "{dest_dir}"'],
         capture_output=True, timeout=15, creationflags=_NO_WINDOW,
@@ -242,6 +301,7 @@ def delete_file_from_device(adb_path, ip, remote_file):
     Check file exists then delete it.
     Returns ("deleted" | "not_found" | "error", message).
     """
+    _ensure_connected(adb_path, ip)
     try:
         r = subprocess.run(
             [adb_path, "-s", f"{ip}:5555", "shell",
@@ -261,6 +321,7 @@ def delete_file_from_device(adb_path, ip, remote_file):
 
 def install_apk_on_device(adb_path, ip, apk_path):
     """Returns (success: bool, message: str)."""
+    _ensure_connected(adb_path, ip)
     try:
         r = subprocess.run(
             [adb_path, "-s", f"{ip}:5555", "install", "-r", "-g", apk_path],
@@ -280,6 +341,7 @@ def list_device_files(adb_path, ip, dest_dir):
     List files in dest_dir on the device.
     Returns list of (filename, size_str). Raises RuntimeError on failure.
     """
+    _ensure_connected(adb_path, ip)
     r = subprocess.run(
         [adb_path, "-s", f"{ip}:5555", "shell", f'ls -la "{dest_dir}/"'],
         capture_output=True, timeout=15, creationflags=_NO_WINDOW,
