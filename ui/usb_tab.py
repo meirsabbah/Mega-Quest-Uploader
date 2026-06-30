@@ -78,9 +78,9 @@ class UsbTab:
         ).grid(row=0, column=0, sticky="w")
         bf = ttk.Frame(ctrl)
         bf.grid(row=0, column=1, sticky="e")
-        ttk.Button(bf, text="Enable All",     command=self._enable_all,      width=14).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(bf, text="Detect Devices", command=self.refresh,          width=16).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(bf, text="Restart ADB",    command=self._restart_adb,     width=14).pack(side=tk.RIGHT)
+        ttk.Button(bf, text="Enable All",     command=self._enable_all,  width=14).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(bf, text="Detect Devices", command=self.refresh,      width=16).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(bf, text="Restart ADB",    command=self._restart_adb, width=14).pack(side=tk.RIGHT)
 
         self.status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
         self.status_label.grid(row=3, column=0, sticky="w", pady=(6, 0))
@@ -191,3 +191,4 @@ class UsbTab:
                 text="ADB server restarted — plug in the headset now."))
             self.root.after(500, self.refresh)
         threading.Thread(target=_worker, daemon=True).start()
+

@@ -129,6 +129,7 @@ def restart_adb_server(adb_path):
     subprocess.run([adb_path, "start-server"], capture_output=True, timeout=15, creationflags=_NO_WINDOW)
 
 
+
 def enable_wifi_adb(adb_path, serial):
     """Returns (success: bool, message: str)."""
     try:
@@ -255,6 +256,8 @@ def push_file(adb_path, ip, file_path, dest_dir, progress_cb):
 
     last_err = ""
     for attempt in range(3):
+        if attempt > 0:
+            _ensure_connected(adb_path, ip)
         stop = threading.Event()
 
         def _poll():
