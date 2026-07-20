@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NitzFlash — unified tool hub."""
 
-VERSION = "1.0.0"
+VERSION = "2.1.1"
 
 import tkinter as tk
 from tkinter import ttk

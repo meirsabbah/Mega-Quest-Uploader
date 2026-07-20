@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 import sv_ttk
 
 try:
@@ -24,25 +24,67 @@ try:
 except ImportError:
     _PIL = False
 
-# ---------------------------------------------------------------------------
-# Encryption key — must match client_player.py
-# ---------------------------------------------------------------------------
-ENCRYPTION_KEY = bytes.fromhex(
-    "a3f8e2b1c4d5e6f708192a3b4c5d6e7f"
-    "809102030405060708090a0b0c0d0e0f"
-)
-
 try:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
     from cryptography.hazmat.backends import default_backend
     _CRYPTO = True
 except ImportError:
     _CRYPTO = False
 
+# ---------------------------------------------------------------------------
+# Access code + encryption key — salt/KDF must match client_player.py
+# ---------------------------------------------------------------------------
+# ACCESS_CODE lives ONLY in this file. setup_usb.py stays on the operator's
+# PC and is never shipped to a customer — client_player.py is what ends up
+# on the USB key (inside client.exe), and it contains no copy of this
+# string, no hash of it, no verifier derived from it. It only has the KDF
+# algorithm and salt below (public parameters — fine to expose) and derives
+# whatever key results from whatever the customer types in. A wrong guess
+# there has nothing to check itself against except a real video failing to
+# decrypt into something playable.
+#
+# To rotate the code: change the string below, then rebuild client.exe via
+# build.bat. Only affects future burns — already-burned drives keep their
+# own client.exe and keep working with whatever code they shipped with.
+ACCESS_CODE = "*181818*"
+
+# Public KDF salt — not secret, just fixed so derivation is reproducible.
+# Must match client_player.py.
+_KDF_SALT = bytes.fromhex(
+    "a3f8e2b1c4d5e6f708192a3b4c5d6e7f"
+    "809102030405060708090a0b0c0d0e0f"
+)
+
+
+def derive_key(password):
+    """scrypt is deliberately slow and memory-hard (~0.3s, ~128MB per
+    attempt on typical hardware) so brute-forcing the access code offline
+    is expensive, not just inconvenient. Must match client_player.py."""
+    kdf = Scrypt(salt=_KDF_SALT, length=32, n=2 ** 17, r=8, p=1)
+    return kdf.derive(password.encode("utf-8"))
+
+
+ENCRYPTION_KEY = derive_key(ACCESS_CODE) if _CRYPTO else None
+# Non-secret fingerprint of the current key, stored alongside cached local
+# encryptions so rotating ACCESS_CODE automatically invalidates them instead
+# of silently reusing ciphertext from the old key on a new burn.
+_KEY_FP = hashlib.sha256(ENCRYPTION_KEY).hexdigest()[:16] if _CRYPTO else None
+
 LIBRARY_DIR   = Path.home() / "VideoEncrypterLibrary"
 ENCRYPTED_DIR = LIBRARY_DIR / "encrypted"
 LIBRARY_INDEX = LIBRARY_DIR / "library.json"
+PRESETS_FILE  = LIBRARY_DIR / "presets.json"
 CHUNK         = 8 * 1024 * 1024   # 8 MB
+
+# Bundled under an ASCII name (video_encrypter/instructions.pdf) because
+# build.bat / the PyInstaller spec pass this path through cmd.exe, which
+# reads non-ASCII text using the console's OEM code page and corrupts
+# Hebrew filenames before PyInstaller ever sees them. The Hebrew name below
+# is only ever used as a plain Python file write onto the USB drive, which
+# has no such encoding problem.
+INSTRUCTIONS_PDF_RESOURCE = "instructions.pdf"
+INSTRUCTIONS_PDF_NAME     = "הוראות_הפעלה.pdf"
 
 SYSTEM_NAMES = {"System Volume Information", "$RECYCLE.BIN", "desktop.ini",
                 "RECYCLER", "Thumbs.db", "autorun.inf"}
@@ -137,18 +179,44 @@ def copy_with_progress(src, dst, on_progress=None):
                 on_progress(done / total)
 
 
+def copy_client_tree(client_dir, drive_root, exe_name):
+    """Copy the onedir client build (client.exe + vlc_runtime + _internal)
+    to the USB root, renaming only the top-level exe to the customer's title.
+    Returns the list of sibling support-folder paths written (to be hidden).
+    """
+    shutil.copy2(client_dir / "client.exe", drive_root / exe_name)
+    support_dirs = []
+    for entry in client_dir.iterdir():
+        if entry.name == "client.exe":
+            continue
+        dst = drive_root / entry.name
+        if entry.is_dir():
+            shutil.copytree(entry, dst, dirs_exist_ok=True)
+            support_dirs.append(dst)
+        else:
+            shutil.copy2(entry, dst)
+    return support_dirs
+
+
 def hide_path(path):
     subprocess.run(["attrib", "+H", "+S", str(path)], capture_output=True)
 
 
 def set_drive_label(drive, label):
-    safe   = re.sub(r'[\\/*?:"<>|]', "", label)[:32]
+    """Set the USB volume label. Set-Volume caps FAT32/exFAT labels at 11
+    characters and fails the whole call (no volume change) if given more —
+    previously this failure was discarded, so any longer event name left
+    the drive with its default generic name. Returns (success, label_used)
+    so the caller can report what actually happened.
+    """
+    safe   = re.sub(r'[\\/*?:"<>|]', "", label)[:11]
     letter = drive.rstrip(":\\")
-    subprocess.run(
+    r = subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          f'Set-Volume -DriveLetter {letter} -NewFileSystemLabel "{safe}"'],
         capture_output=True,
     )
+    return r.returncode == 0, safe
 
 
 def load_library():
@@ -165,8 +233,38 @@ def save_library(lib):
         json.dump(lib, f, indent=2)
 
 
+def load_presets():
+    if PRESETS_FILE.exists():
+        with open(PRESETS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def save_presets(presets):
+    LIBRARY_DIR.mkdir(parents=True, exist_ok=True)
+    with open(PRESETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(presets, f, ensure_ascii=False, indent=2)
+
+
 def safe_filename(name):
     return re.sub(r'[\\/*?:"<>|]', "_", name).strip() or "video"
+
+
+def unique_filename(base, used_names):
+    """Disambiguate <base>.dat collisions across a batch (e.g. a hash
+    prefix collision) by appending _2, _3, ... before the extension.
+
+    Uses a bland .dat extension and a non-human-readable base (the
+    caller passes a hash prefix, not the display title) so the file
+    doesn't stand out to someone browsing the drive.
+    """
+    name = f"{base}.dat"
+    n = 2
+    while name in used_names:
+        name = f"{base}_{n}.dat"
+        n += 1
+    used_names.add(name)
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -178,17 +276,19 @@ class VideoEncrypterApp:
         self.root     = master
         self.on_back  = on_back
         self.root.title("Video Encrypter — מגן און קי")
-        self.root.geometry("560x560")
+        self.root.geometry("560x740")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW",
                            on_back if on_back else self.root.destroy)
         self._q        = queue.Queue()
         self._logo_img = None
+        self._queue    = []   # pending (video_path, title) pairs staged for this burn
 
         self._load_logo()
         self._build_styles()
         self._build_ui()
         self._refresh_drives()
+        self._refresh_presets_combo()
         self.root.after(80, self._pump_queue)
 
     # ------------------------------------------------------------------
@@ -284,6 +384,36 @@ class VideoEncrypterApp:
                                         font=("Segoe UI", 9))
         self.drive_info_lbl.pack(fill="x", padx=24, pady=(0, 4))
 
+        # Quick burn — reload a saved event/video-list preset and burn it
+        # straight away, for repeat runs of the same batch onto new keys.
+        fq = ttk.Frame(self.root)
+        fq.pack(fill="x", padx=24, pady=(0, 4))
+        ttk.Label(fq, text=f"{_R}הגדרה שמורה", width=12, anchor="e",
+                  font=("Segoe UI", 10)).pack(side="right")
+        self.preset_var = tk.StringVar()
+        self.preset_combo = ttk.Combobox(fq, textvariable=self.preset_var,
+                                         width=20, state="readonly", justify="right")
+        self.preset_combo.pack(side="right", padx=6)
+        self.preset_combo.bind("<<ComboboxSelected>>",
+                               lambda _: self._update_preset_buttons())
+        self.load_burn_btn = ttk.Button(fq, text=f"{_R}טען וצרוב",
+                                        style="Accent.TButton",
+                                        command=self._quick_burn)
+        self.delete_preset_btn = ttk.Button(fq, text=f"{_R}מחק הגדרה",
+                                            command=self._delete_preset)
+        self._preset_btn_frame = fq
+
+        # Event name row — used for the exe filename + drive label, since a
+        # key can now hold several videos with no single title of its own.
+        f0 = ttk.Frame(self.root)
+        f0.pack(fill="x", **P)
+        ttk.Label(f0, text=f"{_R}שם האירוע", width=12, anchor="e",
+                  font=("Segoe UI", 10)).pack(side="right")
+        self.event_entry = self._make_rtl_text(f0)
+        self.event_entry.pack(side="right", padx=6)
+        ttk.Label(f0, text=f"{_R}שם הכונן + שם הקובץ להרצה",
+                  style="Hint.TLabel").pack(side="left", padx=4)
+
         # Video file row
         f2 = ttk.Frame(self.root)
         f2.pack(fill="x", **P)
@@ -299,21 +429,29 @@ class VideoEncrypterApp:
         f3.pack(fill="x", **P)
         ttk.Label(f3, text=f"{_R}שם להצגה", width=12, anchor="e",
                   font=("Segoe UI", 10)).pack(side="right")
-        # tk.Text instead of ttk.Entry — fixes Hebrew RTL character ordering bug in tkinter
-        _s = ttk.Style()
-        _ebg = _s.lookup("TEntry", "fieldbackground") or "#1c1c1c"
-        _efg = _s.lookup("TEntry", "foreground") or "#ffffff"
-        self.title_entry = tk.Text(
-            f3, height=1, width=34, wrap="none",
-            font=("Segoe UI", 10),
-            bg=_ebg, fg=_efg, insertbackground=_efg,
-            relief="flat", bd=1,
-            selectbackground="#264f78", selectforeground="#ffffff",
-        )
-        self.title_entry.bind("<Return>", lambda e: "break")
+        self.title_entry = self._make_rtl_text(f3, width=24)
         self.title_entry.pack(side="right", padx=6)
-        ttk.Label(f3, text=f"{_R}(מוצג ללקוח)",
+        ttk.Label(f3, text=f"{_R}מוצג ללקוח",
                   style="Hint.TLabel").pack(side="left", padx=4)
+        ttk.Button(f3, text=f"{_R}+ הוסף לרשימה",
+                  command=self._add_to_queue).pack(side="left", padx=4)
+
+        # Queue of videos staged for this burn
+        f4 = ttk.Frame(self.root)
+        f4.pack(fill="x", padx=24, pady=(2, 4))
+        ttk.Label(f4, text=f"{_R}סרטונים לצריבה:", anchor="e",
+                  font=("Segoe UI", 9)).pack(side="right")
+        ttk.Button(f4, text=f"{_R}הסר מהרשימה",
+                  command=self._remove_from_queue).pack(side="left")
+
+        f5 = ttk.Frame(self.root)
+        f5.pack(fill="x", padx=24, pady=(0, 4))
+        self.queue_list = tk.Listbox(f5, height=5, justify="right",
+                                     activestyle="dotbox", exportselection=False)
+        self.queue_list.pack(side="left", fill="x", expand=True)
+        qscroll = ttk.Scrollbar(f5, orient="vertical", command=self.queue_list.yview)
+        qscroll.pack(side="left", fill="y")
+        self.queue_list.config(yscrollcommand=qscroll.set)
 
         # Library status
         self.lib_lbl = ttk.Label(self.root, text="", style="Orange.TLabel",
@@ -338,6 +476,21 @@ class VideoEncrypterApp:
                            relief="flat", bd=0)
         self.log.tag_configure("rtl", justify="right")
         self.log.pack(fill="x", padx=24, pady=(0, 18))
+
+    def _make_rtl_text(self, parent, width=34):
+        # tk.Text instead of ttk.Entry — fixes Hebrew RTL character ordering bug in tkinter
+        s = ttk.Style()
+        ebg = s.lookup("TEntry", "fieldbackground") or "#1c1c1c"
+        efg = s.lookup("TEntry", "foreground") or "#ffffff"
+        widget = tk.Text(
+            parent, height=1, width=width, wrap="none",
+            font=("Segoe UI", 10),
+            bg=ebg, fg=efg, insertbackground=efg,
+            relief="flat", bd=1,
+            selectbackground="#264f78", selectforeground="#ffffff",
+        )
+        widget.bind("<Return>", lambda e: "break")
+        return widget
 
     # ------------------------------------------------------------------
     # Actions
@@ -400,49 +553,179 @@ class VideoEncrypterApp:
             self.title_entry.insert("1.0", Path(path).stem)
         lib = load_library()
         fh  = hash_file(path)
-        if fh in lib and Path(lib[fh]["enc"]).exists():
+        if fh in lib and lib[fh].get("key_fp") == _KEY_FP and Path(lib[fh]["enc"]).exists():
             self.lib_lbl.config(text=f"{_R}נמצא בספרייה — אין צורך בהצפנה מחדש",
                                 style="Green.TLabel")
         else:
             self.lib_lbl.config(text=f"{_R}לא בספרייה — יוצפן בעת הכתיבה",
                                 style="Orange.TLabel")
 
-    def _burn(self):
-        drive = self.drive_var.get()
+    # ------------------------------------------------------------------
+    # Queue management
+    # ------------------------------------------------------------------
+
+    def _add_to_queue(self):
         video = self.video_var.get()
         title = self.title_entry.get("1.0", "end-1c").strip()
-        if not drive:
-            messagebox.showerror("שגיאה", "יש לבחור כונן USB.", parent=self.root); return
         if not video or not Path(video).exists():
             messagebox.showerror("שגיאה", "יש לבחור קובץ וידאו תקין.", parent=self.root); return
         if not title:
             messagebox.showerror("שגיאה", "יש להזין שם להצגה עבור הסרטון.", parent=self.root); return
+        self._queue.append((video, title))
+        self._refresh_queue_list()
+        self.video_var.set("")
+        self.title_entry.delete("1.0", "end")
+        self.lib_lbl.config(text="")
+
+    def _remove_from_queue(self):
+        sel = self.queue_list.curselection()
+        if not sel:
+            return
+        del self._queue[sel[0]]
+        self._refresh_queue_list()
+
+    def _refresh_queue_list(self):
+        self.queue_list.delete(0, "end")
+        for video, title in self._queue:
+            self.queue_list.insert("end", f"{title}  —  {Path(video).name}")
+        n = len(self._queue)
+        if n == 0:
+            self.burn_btn.config(text=f"{_R}התחל הצפנה")
+        elif n == 1:
+            self.burn_btn.config(text=f"{_R}צרוב סרטון אחד לכונן")
+        else:
+            self.burn_btn.config(text=f"{_R}צרוב {n} סרטונים לכונן")
+
+    # ------------------------------------------------------------------
+    # Presets (quick burn)
+    # ------------------------------------------------------------------
+
+    def _refresh_presets_combo(self):
+        names = sorted(load_presets().keys())
+        self.preset_combo["values"] = names
+        if self.preset_var.get() not in names:
+            self.preset_var.set("")
+        self._update_preset_buttons()
+
+    def _update_preset_buttons(self):
+        if self.preset_var.get():
+            if not self.load_burn_btn.winfo_ismapped():
+                self.load_burn_btn.pack(side="left", padx=4)
+            if not self.delete_preset_btn.winfo_ismapped():
+                self.delete_preset_btn.pack(side="left", padx=4)
+        else:
+            self.load_burn_btn.pack_forget()
+            self.delete_preset_btn.pack_forget()
+
+    def _delete_preset(self):
+        name = self.preset_var.get()
+        if not name:
+            return
+        if not messagebox.askyesno(
+            "מחיקת הגדרה", f'{_R}למחוק את ההגדרה "{name}"?', parent=self.root,
+        ):
+            return
+        presets = load_presets()
+        presets.pop(name, None)
+        save_presets(presets)
+        self.preset_var.set("")
+        self._refresh_presets_combo()
+
+    def _quick_burn(self):
+        name = self.preset_var.get()
+        if not name:
+            messagebox.showerror("שגיאה", "יש לבחור הגדרה שמורה מהרשימה.", parent=self.root); return
+        preset = load_presets().get(name)
+        if not preset:
+            messagebox.showerror("שגיאה", "ההגדרה לא נמצאה.", parent=self.root); return
+        missing = [it["video"] for it in preset["items"] if not Path(it["video"]).exists()]
+        if missing:
+            messagebox.showerror("שגיאה",
+                "קבצי הוידאו הבאים מההגדרה לא נמצאו:\n" + "\n".join(missing),
+                parent=self.root); return
+
+        self.event_entry.delete("1.0", "end")
+        self.event_entry.insert("1.0", preset["event_name"])
+        self.video_var.set("")
+        self.title_entry.delete("1.0", "end")
+        self._queue = [(it["video"], it["title"]) for it in preset["items"]]
+        self._refresh_queue_list()
+        self._burn()
+
+    def _offer_save_preset(self, event_name, items):
+        if not self.root.winfo_exists():
+            return
+        if not messagebox.askyesno(
+            "שמירת הגדרה",
+            "לשמור את ההגדרה הזו (שם אירוע + רשימת סרטונים) לצריבה מהירה בפעם הבאה?",
+            parent=self.root,
+        ):
+            return
+        name = simpledialog.askstring(
+            "שמירת הגדרה", "שם לשמירה:", parent=self.root,
+        )
+        name = (name or "").strip()
+        if not name:
+            return
+        presets = load_presets()
+        presets[name] = {
+            "event_name": event_name,
+            "items": [{"video": str(video), "title": title} for video, title in items],
+        }
+        save_presets(presets)
+        self._refresh_presets_combo()
+
+    def _pending_queue(self):
+        """The staged queue, plus whatever's still sitting in the input
+        fields but not yet explicitly added — keeps the single-video flow
+        exactly as simple as before (fill fields, click burn, done)."""
+        items = list(self._queue)
+        video = self.video_var.get()
+        title = self.title_entry.get("1.0", "end-1c").strip()
+        if video and Path(video).exists() and title:
+            items.append((video, title))
+        return items
+
+    def _burn(self):
+        drive = self.drive_var.get()
+        event_name = self.event_entry.get("1.0", "end-1c").strip()
+        items = self._pending_queue()
+        if not drive:
+            messagebox.showerror("שגיאה", "יש לבחור כונן USB.", parent=self.root); return
+        if not items:
+            messagebox.showerror("שגיאה", "יש להוסיף לפחות סרטון אחד לרשימה.", parent=self.root); return
+        if not event_name:
+            messagebox.showerror("שגיאה", "יש להזין שם לאירוע.", parent=self.root); return
         if not drive_is_empty(drive):
             messagebox.showerror("שגיאה",
                 f"הכונן {drive} אינו ריק.\n\n"
                 "יש לפרמט אותו (לחיצה ימנית ← פרמט בסייר) ולנסות שוב.",
                 parent=self.root); return
-        client_exe = self._find_client()
-        if not client_exe:
+        client_dir = self._find_client()
+        if not client_dir:
             messagebox.showerror("שגיאה",
-                "הקובץ client.exe לא נמצא.\n"
-                "יש להניח אותו בתיקייה שבה נמצא NitzFlash.exe.",
+                "תיקיית client (עם client.exe) לא נמצאה.\n"
+                "יש להניח אותה בתיקייה שבה נמצא NitzFlash.exe.",
                 parent=self.root); return
 
         self.burn_btn.config(state="disabled")
         threading.Thread(target=self._worker,
-                         args=(drive, video, title, client_exe), daemon=True).start()
+                         args=(drive, items, event_name, client_dir), daemon=True).start()
 
     def _find_client(self):
+        """Locate the onedir client build folder (client.exe + vlc_runtime +
+        _internal). Returns the folder, not the exe, since the whole tree
+        needs to be copied to the USB.
+        """
         from core.utils import resource_dir
         candidates = [
-            resource_dir() / "client.exe",
-            Path(sys.executable).parent / "client.exe",
-            Path(__file__).resolve().parent.parent / "client.exe",
-            Path(__file__).resolve().parent / "dist" / "client.exe",
+            resource_dir() / "client",
+            Path(sys.executable).parent / "client",
+            Path(__file__).resolve().parent.parent / "client",
+            Path(__file__).resolve().parent / "dist" / "client",
         ]
         for p in candidates:
-            if p.exists():
+            if (p / "client.exe").exists():
                 return p
         return None
 
@@ -450,67 +733,107 @@ class VideoEncrypterApp:
     # Background worker
     # ------------------------------------------------------------------
 
-    def _worker(self, drive, video_path, title, client_exe):
+    def _worker(self, drive, items, event_name, client_dir):
         try:
-            self._log(f"{_R}מתחיל תהליך כתיבה...")
-            lib           = load_library()
-            fh            = hash_file(video_path)
-            original_name = Path(video_path).name
-            ext           = Path(video_path).suffix
-
-            cached = fh in lib and Path(lib[fh]["enc"]).exists()
-            if cached:
-                enc_path = Path(lib[fh]["enc"])
-                self._log(f"{_R}נמצא בספרייה — משתמש ב-{enc_path.name}")
-            else:
-                ENCRYPTED_DIR.mkdir(parents=True, exist_ok=True)
-                enc_path = ENCRYPTED_DIR / f"{fh[:16]}.enc"
-                self._log(f"{_R}מצפין וידאו (עשוי לקחת זמן)...")
-
-                def ep(pct):
-                    self._set_progress(pct * 65, f"{_R}מצפין... {int(pct*100)}%")
-
-                encrypt_to(video_path, enc_path, ep)
-                lib[fh] = {"enc": str(enc_path), "name": original_name}
-                save_library(lib)
-                self._log(f"{_R}הוצפן ונשמר בספרייה: {enc_path.name}")
-
-            set_drive_label(drive, title)
-            self._log(f"{_R}שם הכונן עודכן: {title}")
-            self._log(f"{_R}מעתיק קבצים לכונן...")
-            media        = Path(drive + "\\") / "media"
+            self._log(f"{_R}מתחיל תהליך כתיבה עבור {len(items)} סרטונים...")
+            lib        = load_library()
+            drive_root = Path(drive + "\\")
+            media      = drive_root / "SystemCache"
             media.mkdir(exist_ok=True)
-            enc_filename = safe_filename(title) + ".enc"
-            dst_enc      = media / enc_filename
-            dst_meta     = media / "meta.txt"
-            exe_name     = safe_filename(title) + ".exe"
-            dst_client   = Path(drive + "\\") / exe_name
 
-            copy_start = 65 if not cached else 0
+            sizes      = [os.path.getsize(video_path) for video_path, _ in items]
+            total_size = sum(sizes) or 1
+            done_size  = 0
+            used_names = set()
+            videos_meta = []
 
-            def cp(pct):
-                self._set_progress(copy_start + pct * (95 - copy_start),
-                                   f"{_R}מעתיק לכונן... {int(pct*100)}%")
+            # Each item's encrypt+copy work is weighted by its source file
+            # size so the single progress bar sweeps smoothly across the
+            # whole batch instead of resetting per video.
+            for (video_path, title), size in zip(items, sizes):
+                fh            = hash_file(video_path)
+                original_name = Path(video_path).name
+                ext           = Path(video_path).suffix
+                base_done     = done_size
+                # Only reuse a cached encryption if it was made under the
+                # *current* access code — otherwise a rotated code would
+                # silently ship stale ciphertext that the new client.exe
+                # (built with the new code) could never decrypt.
+                cached = (fh in lib and lib[fh].get("key_fp") == _KEY_FP
+                         and Path(lib[fh]["enc"]).exists())
 
-            copy_with_progress(enc_path, dst_enc, cp)
-            dst_meta.write_text(f"{title}\n{ext}", encoding="utf-8")
-            shutil.copy2(client_exe, dst_client)
-            self._log(f"{_R}הקבצים הועתקו.")
+                if cached:
+                    enc_path = Path(lib[fh]["enc"])
+                    self._log(f"{_R}{title}: נמצא בספרייה — משתמש ב-{enc_path.name}")
+                else:
+                    ENCRYPTED_DIR.mkdir(parents=True, exist_ok=True)
+                    enc_path = ENCRYPTED_DIR / f"{fh[:16]}.enc"
+                    self._log(f"{_R}{title}: מצפין (עשוי לקחת זמן)...")
 
-            hide_path(dst_enc)
+                    def ep(pct, base_done=base_done, size=size, title=title):
+                        self._set_progress((base_done + pct * size) / total_size * 90,
+                                           f"{_R}מצפין את \"{title}\"... {int(pct*100)}%")
+
+                    encrypt_to(video_path, enc_path, ep)
+                    lib[fh] = {"enc": str(enc_path), "name": original_name, "key_fp": _KEY_FP}
+                    save_library(lib)
+                    self._log(f"{_R}{title}: הוצפן ונשמר בספרייה.")
+
+                enc_filename = unique_filename(fh[:16], used_names)
+                dst_enc      = media / enc_filename
+
+                def cp(pct, base_done=base_done, size=size, title=title):
+                    self._set_progress((base_done + pct * size) / total_size * 90,
+                                       f"{_R}מעתיק את \"{title}\"... {int(pct*100)}%")
+
+                copy_with_progress(enc_path, dst_enc, cp)
+                hide_path(dst_enc)
+                videos_meta.append({"title": title, "ext": ext, "enc": enc_filename})
+                done_size += size
+
+            label_ok, applied_label = set_drive_label(drive, event_name)
+            if label_ok:
+                self._log(f"{_R}שם הכונן עודכן: {applied_label}")
+            else:
+                self._log(f"{_R}אזהרה: לא הצלחתי לשנות את שם הכונן.")
+
+            dst_meta = media / "meta.json"
+            dst_meta.write_text(
+                json.dumps({"event": event_name, "videos": videos_meta},
+                          ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             hide_path(dst_meta)
             hide_path(media)
-            self._log(f"{_R}תיקיית המדיה הוסתרה.")
+
+            self._set_progress(92, f"{_R}מעתיק את נגן ה-USB (כולל LibVLC)...")
+            exe_name     = safe_filename(event_name) + ".exe"
+            support_dirs = copy_client_tree(client_dir, drive_root, exe_name)
+            for d in support_dirs:
+                hide_path(d)
+            self._log(f"{_R}הקבצים הועתקו והוסתרו.")
+
+            instructions_pdf = Path(_resource_path(INSTRUCTIONS_PDF_RESOURCE))
+            if instructions_pdf.exists():
+                shutil.copy2(instructions_pdf, drive_root / INSTRUCTIONS_PDF_NAME)
+                self._log(f"{_R}קובץ ההוראות הועתק לכונן.")
+            else:
+                self._log(f"{_R}אזהרה: קובץ ההוראות ({INSTRUCTIONS_PDF_NAME}) לא נמצא ולא הועתק.")
 
             self._set_progress(100, f"{_R}הסתיים!")
             self._log(f"{_R}הכתיבה הושלמה! הכונן מוכן.")
-            self._ui(lambda: messagebox.showinfo(
-                "הסתיים",
-                f"הכונן {drive} מוכן!\n\n"
-                f"הלקוח לוחץ פעמיים על:\n{exe_name}\n\n"
-                f"קובץ מוצפן:\n{enc_filename}",
-                parent=self.root,
-            ))
+
+            def _on_finished():
+                messagebox.showinfo(
+                    "הסתיים",
+                    f"הכונן {drive} מוכן!\n\n"
+                    f"הלקוח לוחץ פעמיים על:\n{exe_name}\n\n"
+                    f"{len(items)} סרטונים נכתבו.",
+                    parent=self.root,
+                )
+                self._offer_save_preset(event_name, items)
+
+            self._ui(_on_finished)
         except Exception as e:
             msg = str(e)
             if "28" in msg or "space" in msg.lower() or "no space" in msg.lower():

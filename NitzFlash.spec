@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('icon.ico', '.'), ('quest_uploader_logo.png', '.'), ('video_encrypter/logo.png', 'video_encrypter'), ('video_encrypter/logo_white.png', 'video_encrypter'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tcl8.6', 'tcl'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tk8.6', 'tk')]
+datas = [('icon.ico', '.'), ('quest_uploader_logo.png', '.'), ('video_encrypter/logo.png', 'video_encrypter'), ('video_encrypter/logo_white.png', 'video_encrypter'), ('video_encrypter/instructions.pdf', 'video_encrypter'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tcl8.6', 'tcl'), ('C:\\Users\\meirs\\AppData\\Local\\Programs\\Python\\Python311\\tcl\\tk8.6', 'tk')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('tkinter')
