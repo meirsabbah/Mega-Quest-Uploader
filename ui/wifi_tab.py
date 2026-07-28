@@ -17,7 +17,7 @@ class WifiTab:
     def __init__(self, parent, app):
         self.app = app              # exposes app.root, app.adb_path
 
-        self.wifi_devices = {}      # ip -> {name, status, item_id}
+        self.wifi_devices = {}      # ip -> {name, battery, status, item_id}
         self.file_paths = []
         self.busy = False
         self.scanning = False
@@ -57,20 +57,23 @@ class WifiTab:
 
         scan_bar = ttk.Frame(left)
         scan_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        scan_bar.columnconfigure(1, weight=1)
         self.scan_btn = ttk.Button(scan_bar, text="Scan Network",
                                    command=self.start_scan, width=16)
         self.scan_btn.grid(row=0, column=0)
+        self.clear_btn = ttk.Button(scan_bar, text="Clear List",
+                                    command=self._clear_devices, width=10)
+        self.clear_btn.grid(row=0, column=1, padx=(4, 0))
         self.device_count_label = ttk.Label(scan_bar, text="Devices found: 0",
                                             foreground="#555")
-        self.device_count_label.grid(row=0, column=1, sticky="e")
+        self.device_count_label.grid(row=0, column=2, sticky="e")
+        scan_bar.columnconfigure(2, weight=1)
 
         lf = ttk.LabelFrame(left, text="Connected Devices", padding=4)
         lf.grid(row=1, column=0, sticky="nsew")
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
 
-        cols = ("IP Address", "Device Name", "Status")
+        cols = ("IP Address", "Device Name", "Battery", "Status")
         self.tree = ttk.Treeview(lf, columns=cols, show="headings", selectmode="extended")
         self._sort_col = None
         self._sort_asc = True
@@ -79,6 +82,7 @@ class WifiTab:
                               command=lambda c=col: self._sort_by(c))
         self.tree.column("IP Address",  width=130, minwidth=100)
         self.tree.column("Device Name", width=200, minwidth=130)
+        self.tree.column("Battery",     width=70,  minwidth=60, anchor="center")
         self.tree.column("Status",      width=340, minwidth=180)
         for tag, bg, fg in (
             ("done",      "#1a3d2b", "#00bc8c"),
@@ -256,6 +260,7 @@ class WifiTab:
             return
         self.busy = True
         self.scan_btn.config(state=tk.DISABLED)
+        self.clear_btn.config(state=tk.DISABLED)
         self._refresh_buttons()
         for ip in selected_ips:
             self._set_status(ip, "Waiting to install...", "")
@@ -295,7 +300,7 @@ class WifiTab:
         for rank, (_, iid) in enumerate(items):
             self.tree.move(iid, "", rank)
         arrow = " ▲" if self._sort_asc else " ▼"
-        for c in ("IP Address", "Device Name", "Status"):
+        for c in ("IP Address", "Device Name", "Battery", "Status"):
             self.tree.heading(c, text=c + (arrow if c == col else ""),
                               command=lambda cc=c: self._sort_by(cc))
 
@@ -361,18 +366,33 @@ class WifiTab:
             return
         self.scanning = True
         self.scan_btn.config(state=tk.DISABLED, text="Scanning...")
+        self.clear_btn.config(state=tk.DISABLED)
         self.upload_btn.config(state=tk.DISABLED)
         self.delete_btn.config(state=tk.DISABLED)
-        self.tree.delete(*self.tree.get_children())
-        self.wifi_devices.clear()
-        self.device_count_label.config(text="Devices found: 0")
-        self.selected_label.config(text="Selected: 0 / 0")
+        # Deliberately not clearing the tree/wifi_devices here: a device that
+        # answered on a previous scan but gets missed on this pass (flaky wifi,
+        # adb server contention) should stay visible instead of disappearing —
+        # that's what forced users to click Scan repeatedly. Use "Clear List"
+        # to force a clean slate.
         self.status_label.config(text="Scanning network for devices on port 5555...")
         self.progress_var.set(0)
         threading.Thread(target=self._scan_worker, daemon=True).start()
 
+    def _clear_devices(self):
+        if self.scanning or self.busy:
+            return
+        self.tree.delete(*self.tree.get_children())
+        self.wifi_devices.clear()
+        self.device_count_label.config(text="Devices found: 0")
+        self.selected_label.config(text="Selected: 0 / 0")
+        self.status_label.config(text="List cleared — scan the network to find devices.")
+
     def _scan_worker(self):
         try:
+            # Warm the adb server up before flooding it with concurrent probes —
+            # otherwise the first scan after launch races the server's own
+            # cold start and loses connect attempts.
+            adb.ensure_server_running(self.adb_path)
             subnet = adb.get_local_subnet()
             hosts = list(ipaddress.IPv4Network(subnet, strict=False).hosts())
             self.root.after(0, self.status_label.config,
@@ -381,17 +401,30 @@ class WifiTab:
             def probe(ip):
                 result = adb.probe_device(self.adb_path, str(ip))
                 if result:
-                    _, name = result
-                    self.root.after(0, self._add_device, str(ip), name)
+                    _, name, battery = result
+                    self.root.after(0, self._add_device, str(ip), name, battery)
 
             with ThreadPoolExecutor(max_workers=100) as ex:
                 ex.map(probe, hosts)
         finally:
             self.root.after(0, self._scan_done)
 
-    def _add_device(self, ip, name):
-        item_id = self.tree.insert("", tk.END, values=(ip, name, "Ready"))
-        self.wifi_devices[ip] = {"name": name, "status": "Ready", "item_id": item_id}
+    @staticmethod
+    def _battery_str(battery):
+        return f"{battery}%" if battery is not None else "—"
+
+    def _add_device(self, ip, name, battery):
+        battery_str = self._battery_str(battery)
+        if ip in self.wifi_devices:
+            # Already known from a previous scan pass — refresh name/battery
+            # in place without touching selection or in-flight status.
+            d = self.wifi_devices[ip]
+            d["name"], d["battery"] = name, battery_str
+            self.tree.item(d["item_id"], values=(ip, name, battery_str, d["status"]))
+            return
+        item_id = self.tree.insert("", tk.END, values=(ip, name, battery_str, "Ready"))
+        self.wifi_devices[ip] = {"name": name, "battery": battery_str,
+                                 "status": "Ready", "item_id": item_id}
         self.tree.selection_add(item_id)
         total    = len(self.tree.get_children())
         selected = len(self.tree.selection())
@@ -401,6 +434,7 @@ class WifiTab:
     def _scan_done(self):
         self.scanning = False
         self.scan_btn.config(state=tk.NORMAL, text="Scan Network")
+        self.clear_btn.config(state=tk.NORMAL)
         self.status_label.config(text=f"Scan complete — {len(self.wifi_devices)} device(s) found.")
         self._refresh_buttons()
 
@@ -425,6 +459,7 @@ class WifiTab:
             return
         self.busy = True
         self.scan_btn.config(state=tk.DISABLED)
+        self.clear_btn.config(state=tk.DISABLED)
         self._refresh_buttons()
         for ip in selected_ips:
             self._set_status(ip, "Waiting...", "")
@@ -512,6 +547,7 @@ class WifiTab:
             return
         self.busy = True
         self.scan_btn.config(state=tk.DISABLED)
+        self.clear_btn.config(state=tk.DISABLED)
         self._refresh_buttons()
         for ip in selected_ips:
             self._set_status(ip, "Waiting to delete...", "")
@@ -559,6 +595,7 @@ class WifiTab:
     def _operation_done(self, op_name):
         self.busy = False
         self.scan_btn.config(state=tk.NORMAL)
+        self.clear_btn.config(state=tk.NORMAL)
         self._refresh_buttons()
         statuses = [d["status"] for d in self.wifi_devices.values()]
         if op_name == "Upload":
@@ -584,7 +621,8 @@ class WifiTab:
         self.wifi_devices[ip]["status"] = status
         item_id = self.wifi_devices[ip]["item_id"]
         name    = self.wifi_devices[ip]["name"]
-        self.tree.item(item_id, values=(ip, name, status), tags=(tag,) if tag else ())
+        battery = self.wifi_devices[ip]["battery"]
+        self.tree.item(item_id, values=(ip, name, battery, status), tags=(tag,) if tag else ())
 
     # ------------------------------------------------------------------
     # File browser

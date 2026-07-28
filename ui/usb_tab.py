@@ -10,7 +10,7 @@ from core import adb
 class UsbTab:
     def __init__(self, parent, app):
         self.app = app              # exposes app.root, app.adb_path
-        self.usb_devices = {}       # serial -> {name, state, status, item_id}
+        self.usb_devices = {}       # serial -> {name, battery, state, status, item_id}
         self.auto_enable_var = tk.BooleanVar(value=True)
         self._refreshing = False    # prevents overlapping poll threads
         self._build(parent)
@@ -50,13 +50,15 @@ class UsbTab:
         lf.columnconfigure(0, weight=1)
         lf.rowconfigure(0, weight=1)
 
-        cols = ("Serial", "Device Name", "Status")
+        cols = ("Serial", "Device Name", "Battery", "Status")
         self.tree = ttk.Treeview(lf, columns=cols, show="headings")
         self.tree.heading("Serial",      text="Serial / ID")
         self.tree.heading("Device Name", text="Device Name")
+        self.tree.heading("Battery",     text="Battery")
         self.tree.heading("Status",      text="Status")
         self.tree.column("Serial",      width=200, minwidth=150)
         self.tree.column("Device Name", width=220, minwidth=150)
+        self.tree.column("Battery",     width=70,  minwidth=60, anchor="center")
         self.tree.column("Status",      width=380, minwidth=200)
         self.tree.tag_configure("ready",    background="#1a3d2b", foreground="#00bc8c")
         self.tree.tag_configure("enabling", background="#3d2e00", foreground="#f39c12")
@@ -79,7 +81,8 @@ class UsbTab:
         bf = ttk.Frame(ctrl)
         bf.grid(row=0, column=1, sticky="e")
         ttk.Button(bf, text="Enable All",     command=self._enable_all,  width=14).pack(side=tk.RIGHT, padx=(4, 0))
-        ttk.Button(bf, text="Detect Devices", command=self.refresh,      width=16).pack(side=tk.RIGHT, padx=(4, 0))
+        self.detect_btn = ttk.Button(bf, text="Detect Devices", command=self.refresh, width=16)
+        self.detect_btn.pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(bf, text="Restart ADB",    command=self._restart_adb, width=14).pack(side=tk.RIGHT)
 
         self.status_label = ttk.Label(parent, text="Plug in headsets, then click 'Detect Devices'.")
@@ -93,15 +96,16 @@ class UsbTab:
         if serial in self.usb_devices:
             return
         if state == "unauthorized":
-            name = "—"
+            name, battery = "—", "—"
             status, tag = "Waiting — accept USB Debugging on the headset", "unauth"
         else:
-            _, name = adb.get_device_info_usb(self.adb_path, serial)
+            _, name, battery_pct = adb.get_device_info_usb(self.adb_path, serial)
+            battery = f"{battery_pct}%" if battery_pct is not None else "—"
             status, tag = "Connected", ""
 
-        item_id = self.tree.insert("", tk.END, values=(serial, name, status),
+        item_id = self.tree.insert("", tk.END, values=(serial, name, battery, status),
                                    tags=(tag,) if tag else ())
-        self.usb_devices[serial] = {"name": name, "state": state,
+        self.usb_devices[serial] = {"name": name, "battery": battery, "state": state,
                                     "status": status, "item_id": item_id}
         self.status_label.config(text=f"{len(self.usb_devices)} device(s) connected via USB.")
 
@@ -111,8 +115,9 @@ class UsbTab:
     def on_authorized(self, serial):
         if serial not in self.usb_devices:
             return
-        _, name = adb.get_device_info_usb(self.adb_path, serial)
-        self.usb_devices[serial].update({"state": "device", "name": name})
+        _, name, battery_pct = adb.get_device_info_usb(self.adb_path, serial)
+        battery = f"{battery_pct}%" if battery_pct is not None else "—"
+        self.usb_devices[serial].update({"state": "device", "name": name, "battery": battery})
         self._update_row(serial, name, "Authorized — enabling WiFi ADB...", "enabling")
         if self.auto_enable_var.get():
             threading.Thread(target=self._do_enable, args=(serial,), daemon=True).start()
@@ -132,24 +137,47 @@ class UsbTab:
     # ------------------------------------------------------------------
 
     def refresh(self):
-        if self.adb_path and not self._refreshing:
-            threading.Thread(target=self._refresh_worker, daemon=True).start()
+        if not self.adb_path:
+            messagebox.showerror("ADB Not Found", "ADB not found.")
+            return
+        if self._refreshing:
+            return
+        self.detect_btn.config(state=tk.DISABLED, text="Detecting...")
+        # Always say something, even if nothing changes — a click that produces
+        # no visible reaction is indistinguishable from a broken button.
+        self.status_label.config(text="Detecting USB devices...")
+        threading.Thread(target=self._refresh_worker, daemon=True).start()
 
     def _refresh_worker(self):
         self._refreshing = True
+        changed = False
         try:
             current = adb.get_usb_devices_raw(self.adb_path)
             for serial, state in current.items():
                 if serial not in self.usb_devices:
                     self.root.after(0, self.on_appeared, serial, state)
+                    changed = True
                 elif state == "device" and self.usb_devices[serial]["state"] == "unauthorized":
                     # Device just got authorized on the headset — enable without needing a restart
                     self.root.after(0, self.on_authorized, serial)
+                    changed = True
             for serial in list(self.usb_devices.keys()):
                 if serial not in current:
                     self.root.after(0, self.on_removed, serial)
+                    changed = True
         finally:
             self._refreshing = False
+            self.root.after(0, self._refresh_done, changed)
+
+    def _refresh_done(self, changed):
+        self.detect_btn.config(state=tk.NORMAL, text="Detect Devices")
+        if not changed:
+            if self.usb_devices:
+                self.status_label.config(
+                    text=f"No changes — {len(self.usb_devices)} device(s) still connected via USB.")
+            else:
+                self.status_label.config(
+                    text="No USB devices detected. Check the cable/drivers, or try Restart ADB.")
 
     def _enable_all(self):
         targets = [s for s, d in self.usb_devices.items() if d["state"] == "device"]
@@ -178,8 +206,10 @@ class UsbTab:
         if serial not in self.usb_devices:
             return
         self.usb_devices[serial]["status"] = status
+        self.usb_devices[serial]["name"] = name
+        battery = self.usb_devices[serial].get("battery", "—")
         self.tree.item(self.usb_devices[serial]["item_id"],
-                       values=(serial, name, status), tags=(tag,) if tag else ())
+                       values=(serial, name, battery, status), tags=(tag,) if tag else ())
 
     def _restart_adb(self):
         if not self.adb_path:

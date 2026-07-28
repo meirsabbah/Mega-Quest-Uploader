@@ -98,15 +98,39 @@ def get_usb_devices_raw(adb_path):
     r = subprocess.run([adb_path, "devices"], capture_output=True, text=True,
                        timeout=10, creationflags=_NO_WINDOW)
     result = {}
-    for line in r.stdout.splitlines()[1:]:
+    started = False
+    for line in r.stdout.splitlines():
+        # A cold-starting adb server prints "daemon not running; starting now..."
+        # lines before the real header — skip everything until we see it, so
+        # those preamble lines never get misparsed as a bogus device entry.
+        if not started:
+            if line.strip().startswith("List of devices attached"):
+                started = True
+            continue
         parts = line.strip().split()
         if len(parts) >= 2 and ":" not in parts[0]:
             result[parts[0]] = parts[1]
     return result
 
 
+def get_battery_level(adb_path, serial):
+    """Return battery percentage (int) for serial, or None if unavailable."""
+    try:
+        r = subprocess.run(
+            [adb_path, "-s", serial, "shell", "dumpsys battery"],
+            capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+        )
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.lower().startswith("level:"):
+                return int(line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    return None
+
+
 def get_device_info_usb(adb_path, serial):
-    """Return (model, display_name) for a USB-connected device."""
+    """Return (model, display_name, battery_pct) for a USB-connected device."""
     try:
         r = subprocess.run(
             [adb_path, "-s", serial, "shell", "getprop ro.product.model"],
@@ -114,9 +138,10 @@ def get_device_info_usb(adb_path, serial):
         )
         model = r.stdout.strip() or "Unknown"
         name = get_showtime_name(adb_path, serial) or model
-        return model, name
+        battery = get_battery_level(adb_path, serial)
+        return model, name, battery
     except Exception:
-        return "Unknown", "Unknown"
+        return "Unknown", "Unknown", None
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +152,17 @@ def restart_adb_server(adb_path):
     """Kill and restart the ADB server. Forces re-authorization on all connected devices."""
     subprocess.run([adb_path, "kill-server"],  capture_output=True, timeout=10, creationflags=_NO_WINDOW)
     subprocess.run([adb_path, "start-server"], capture_output=True, timeout=15, creationflags=_NO_WINDOW)
+
+
+def ensure_server_running(adb_path):
+    """Make sure the adb server is already up before a burst of concurrent calls.
+    Without this, the first scan after launch can start the server mid-flood,
+    and the concurrent connect attempts that race the cold start tend to fail."""
+    try:
+        subprocess.run([adb_path, "start-server"], capture_output=True, timeout=15,
+                       creationflags=_NO_WINDOW)
+    except Exception:
+        pass
 
 
 
@@ -165,12 +201,18 @@ def get_local_subnet():
 
 
 def probe_device(adb_path, ip_str):
-    """Try to connect to ip_str:5555. Returns (model, name) or None."""
+    """Try to connect to ip_str:5555. Returns (model, name, battery_pct) or None."""
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(0.5)
-        open_ = sock.connect_ex((ip_str, 5555)) == 0
-        sock.close()
+        open_ = False
+        for attempt in range(2):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # 0.8s: long enough that a headset whose WiFi radio is dozing gets
+            # a fair shot at answering, without making a 510-host sweep crawl.
+            sock.settimeout(0.8)
+            open_ = sock.connect_ex((ip_str, 5555)) == 0
+            sock.close()
+            if open_:
+                break
         if not open_:
             return None
         r = subprocess.run(
@@ -178,7 +220,15 @@ def probe_device(adb_path, ip_str):
             capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
         )
         if "connected" not in r.stdout.lower():
-            return None
+            # adb server contention under heavy concurrency can flake the first
+            # attempt even when the port is genuinely open — one retry recovers
+            # most of those without requiring the user to click Scan again.
+            r = subprocess.run(
+                [adb_path, "connect", f"{ip_str}:5555"],
+                capture_output=True, text=True, timeout=10, creationflags=_NO_WINDOW,
+            )
+            if "connected" not in r.stdout.lower():
+                return None
         # If the entry was already in ADB's list as offline, force a clean reconnect.
         state_r = subprocess.run(
             [adb_path, "-s", f"{ip_str}:5555", "get-state"],
@@ -213,7 +263,8 @@ def probe_device(adb_path, ip_str):
             time.sleep(0.4)
         model = model or "Unknown"
         name = get_showtime_name(adb_path, f"{ip_str}:5555") or model
-        return model, name
+        battery = get_battery_level(adb_path, f"{ip_str}:5555")
+        return model, name, battery
     except Exception:
         return None
 
