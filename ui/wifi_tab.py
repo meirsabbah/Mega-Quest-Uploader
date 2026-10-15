@@ -13,12 +13,24 @@ from core.utils import resource_dir
 from ui.file_browser import open_file_browser
 
 
+class _AddToDeleteList:
+    """StringVar-like shim: the file browser's 'Copy Name' calls .set(name),
+    which appends the name to the delete list instead of overwriting a field."""
+
+    def __init__(self, tab):
+        self._tab = tab
+
+    def set(self, value):
+        self._tab._add_delete_names(value)
+
+
 class WifiTab:
     def __init__(self, parent, app):
         self.app = app              # exposes app.root, app.adb_path
 
         self.wifi_devices = {}      # ip -> {name, battery, status, item_id}
         self.file_paths = []
+        self.delete_names = []
         self.busy = False
         self.scanning = False
         self._apk_paths = {}
@@ -151,11 +163,29 @@ class WifiTab:
         del_frame = ttk.LabelFrame(right, text="Delete File from Devices", padding=6)
         del_frame.grid(row=r, column=0, sticky="ew"); r += 1
         del_frame.columnconfigure(0, weight=1)
-        ttk.Entry(del_frame, textvariable=self.delete_var).grid(
-            row=0, column=0, sticky="ew", pady=(0, 4))
+        entry = ttk.Entry(del_frame, textvariable=self.delete_var)
+        entry.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+        entry.bind("<Return>", lambda e: self._add_delete_names())
+        ttk.Button(del_frame, text="Add", command=self._add_delete_names,
+                   width=8).grid(row=0, column=1, padx=(4, 0), pady=(0, 4))
+        self.delete_listbox = tk.Listbox(
+            del_frame, height=4, selectmode=tk.EXTENDED, activestyle="none",
+            background="#2d2d2d", foreground="#ffffff",
+            selectbackground="#0078d4", selectforeground="#ffffff",
+            relief="flat", highlightthickness=1,
+            highlightbackground="#3d3d3d", highlightcolor="#0078d4",
+        )
+        dsc = ttk.Scrollbar(del_frame, orient=tk.HORIZONTAL, command=self.delete_listbox.xview)
+        self.delete_listbox.configure(xscrollcommand=dsc.set)
+        self.delete_listbox.grid(row=1, column=0, sticky="ew")
+        dsc.grid(row=2, column=0, sticky="ew")
+        db = ttk.Frame(del_frame)
+        db.grid(row=1, column=1, sticky="n", padx=(4, 0))
+        ttk.Button(db, text="Remove", command=self._remove_selected_delete_names, width=8).pack(pady=1)
+        ttk.Button(db, text="Clear",  command=self._clear_delete_names,           width=8).pack(pady=1)
         self.delete_btn = ttk.Button(del_frame, text="Delete from Selected Devices",
                                      command=self._delete_from_devices)
-        self.delete_btn.grid(row=1, column=0, sticky="ew")
+        self.delete_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(4, 0))
 
         ttk.Separator(right, orient=tk.HORIZONTAL).grid(row=r, column=0, sticky="ew", pady=8); r += 1
 
@@ -216,6 +246,32 @@ class WifiTab:
     def _clear_files(self):
         self.file_listbox.delete(0, tk.END)
         self.file_paths.clear()
+        self._refresh_buttons()
+
+    # ------------------------------------------------------------------
+    # Delete-list management
+    # ------------------------------------------------------------------
+
+    def _add_delete_names(self, text=None):
+        """Add one or more filenames (newline-separated) to the delete list."""
+        raw = self.delete_var.get() if text is None else text
+        for name in raw.splitlines():
+            name = name.strip()
+            if name and name not in self.delete_names:
+                self.delete_names.append(name)
+                self.delete_listbox.insert(tk.END, name)
+        self.delete_var.set("")
+        self._refresh_buttons()
+
+    def _remove_selected_delete_names(self):
+        for i in reversed(self.delete_listbox.curselection()):
+            self.delete_listbox.delete(i)
+            self.delete_names.pop(i)
+        self._refresh_buttons()
+
+    def _clear_delete_names(self):
+        self.delete_listbox.delete(0, tk.END)
+        self.delete_names.clear()
         self._refresh_buttons()
 
     # ------------------------------------------------------------------
@@ -326,7 +382,7 @@ class WifiTab:
         has_devices = bool(self._get_selected_ips())
         idle = not self.busy and not self.scanning
         self.upload_btn.config(state=tk.NORMAL if (has_devices and self.file_paths and idle) else tk.DISABLED)
-        self.delete_btn.config(state=tk.NORMAL if (has_devices and idle) else tk.DISABLED)
+        self.delete_btn.config(state=tk.NORMAL if (has_devices and self.delete_names and idle) else tk.DISABLED)
         has_apk = bool(self._apk_paths and self.apk_var.get())
         self.install_btn.config(state=tk.NORMAL if (has_devices and has_apk and idle) else tk.DISABLED)
 
@@ -532,17 +588,20 @@ class WifiTab:
     # ------------------------------------------------------------------
 
     def _delete_from_devices(self):
-        filename = self.delete_var.get().strip()
-        if not filename:
-            messagebox.showerror("No Filename", "Enter the exact filename to delete (e.g. movie.mp4).")
+        if self.delete_var.get().strip():
+            self._add_delete_names()    # include whatever is typed/pasted in the entry
+        filenames = list(self.delete_names)
+        if not filenames:
+            messagebox.showerror("No Filename", "Add the exact filename(s) to delete (e.g. movie.mp4).")
             return
         selected_ips = self._get_selected_ips()
         if not selected_ips:
             messagebox.showerror("No Devices", "Select at least one device.")
             return
+        listing = "\n".join(filenames[:10]) + (f"\n... and {len(filenames) - 10} more" if len(filenames) > 10 else "")
         if not messagebox.askyesno(
             "Confirm Delete",
-            f"Delete  '{filename}'  from {len(selected_ips)} device(s)?\n\nThis cannot be undone.",
+            f"Delete {len(filenames)} file(s) from {len(selected_ips)} device(s)?\n\n{listing}\n\nThis cannot be undone.",
         ):
             return
         self.busy = True
@@ -552,30 +611,49 @@ class WifiTab:
         for ip in selected_ips:
             self._set_status(ip, "Waiting to delete...", "")
         self.progress_var.set(0)
-        dest_dir    = self.dest_var.get().strip()
-        remote_file = dest_dir.rstrip("/") + "/" + filename
+        dest_dir = self.dest_var.get().strip()
         threading.Thread(
             target=self._delete_worker,
-            args=(selected_ips, remote_file, filename),
+            args=(selected_ips, dest_dir, filenames),
             daemon=True,
         ).start()
 
-    def _delete_one(self, ip, remote_file, filename, counter, total, lock):
-        self.root.after(0, self._set_status, ip, f"Checking for {filename}...", "checking")
-        result, _ = adb.delete_file_from_device(self.adb_path, ip, remote_file)
-        if result == "not_found":
-            self.root.after(0, self._set_status, ip, "File not found — skipped", "skipped")
-        elif result == "deleted":
-            self.root.after(0, self._set_status, ip, f"Deleted: {filename}", "done")
+    def _delete_one(self, ip, dest_dir, filenames, counter, total, lock):
+        n = len(filenames)
+        deleted = missing = errors = 0
+        for i, filename in enumerate(filenames):
+            prefix = f"[{i+1}/{n}] {filename}: " if n > 1 else f"{filename}: "
+            self.root.after(0, self._set_status, ip, f"{prefix}Checking...", "checking")
+            remote_file = dest_dir.rstrip("/") + "/" + filename
+            result, _ = adb.delete_file_from_device(self.adb_path, ip, remote_file)
+            if result == "deleted":
+                deleted += 1
+            elif result == "not_found":
+                missing += 1
+            else:
+                errors += 1
+        if n == 1:
+            if deleted:
+                final, tag = f"Deleted: {filenames[0]}", "done"
+            elif missing:
+                final, tag = "File not found — skipped", "skipped"
+            else:
+                final, tag = "Delete failed", "error"
         else:
-            self.root.after(0, self._set_status, ip, "Delete failed", "error")
+            parts = []
+            if deleted: parts.append(f"Deleted {deleted}")
+            if missing: parts.append(f"{missing} not found")
+            if errors:  parts.append(f"{errors} failed")
+            final = " | ".join(parts)
+            tag = "error" if errors else ("done" if deleted else "skipped")
+        self.root.after(0, self._set_status, ip, final, tag)
         self._tick_progress(counter, total, lock, "deleted")
 
-    def _delete_worker(self, selected_ips, remote_file, filename):
+    def _delete_worker(self, selected_ips, dest_dir, filenames):
         counter, lock = [0], threading.Lock()
         with ThreadPoolExecutor(max_workers=self.batch_var.get()) as ex:
             for ip in selected_ips:
-                ex.submit(self._delete_one, ip, remote_file, filename,
+                ex.submit(self._delete_one, ip, dest_dir, filenames,
                           counter, len(selected_ips), lock)
         self.root.after(0, self._operation_done, "Delete")
 
@@ -605,7 +683,7 @@ class WifiTab:
             summary = f"Upload complete — {ok} uploaded, {skp} skipped, {err} errors."
         elif op_name == "Delete":
             ok  = sum(1 for s in statuses if s.startswith("Deleted"))
-            skp = sum(1 for s in statuses if "not found" in s)
+            skp = sum(1 for s in statuses if "not found" in s and not s.startswith("Deleted"))
             err = sum(1 for s in statuses if "failed" in s or "Error" in s)
             summary = f"Delete complete — {ok} deleted, {skp} not found, {err} errors."
         else:
@@ -645,6 +723,6 @@ class WifiTab:
             self.root, self.adb_path,
             ip, self.wifi_devices[ip]["name"],
             self.dest_var.get().strip(),
-            self.delete_var,
+            _AddToDeleteList(self),
             deselect_cb,
         )
